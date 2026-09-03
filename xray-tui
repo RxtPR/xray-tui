@@ -1,0 +1,672 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+VERSION="0.3.3"
+APP="xray-tui"
+ETC_DIR="${XRAY_TUI_ETC:-/etc/xray-tui}"
+PROFILE_DIR="$ETC_DIR/profiles"
+ACTIVE_LINK="$ETC_DIR/active.json"
+ACTIVE_NAME="$ETC_DIR/active-profile"
+MODE_FILE="$ETC_DIR/mode"
+SERVICE="xray-tui.service"
+TUN_NAME="xray0"
+TUN_TABLE="20220"
+TUN_STATE="/run/xray-tui/tun.state"
+SOCKS_PORT="${XRAY_TUI_SOCKS_PORT:-10808}"
+HTTP_PORT="${XRAY_TUI_HTTP_PORT:-10809}"
+
+say() { printf '%s\n' "$*"; }
+err() { printf 'xray-tui: %s\n' "$*" >&2; }
+die() { err "$*"; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+usage() {
+  cat <<EOF
+xray-tui $VERSION — менеджер подключений Xray для Debian
+
+Использование:
+  sudo xray-tui                    открыть интерактивное меню
+  sudo xray-tui import [URI]       импортировать vless/vmess/trojan/ss ссылку
+  sudo xray-tui list               список профилей
+  sudo xray-tui up NAME            подключить профиль
+  sudo xray-tui mode proxy|tun     выбрать локальный прокси или системный TUN
+  sudo xray-tui down               отключиться
+  sudo xray-tui status             показать состояние
+  sudo xray-tui probe              проверить внешний IP текущего режима
+  sudo xray-tui logs [LINES]       показать журнал
+  sudo xray-tui show NAME          вывести JSON профиля без секретов
+  sudo xray-tui delete NAME        удалить профиль
+  sudo xray-tui autostart on|off   автозапуск активного профиля
+  sudo ./xray-tui install          установить программу и systemd service
+
+Прокси после подключения: SOCKS5 127.0.0.1:$SOCKS_PORT, HTTP 127.0.0.1:$HTTP_PORT
+EOF
+}
+
+need_root() {
+  (( EUID == 0 )) && return
+  if have sudo; then exec sudo -- "$0" "$@"; fi
+  die "эта команда требует root (запустите через sudo)"
+}
+
+need_runtime() {
+  have python3 || die "не найден python3"
+  have systemctl || die "не найден systemctl"
+  [[ -d "$PROFILE_DIR" ]] || die "программа не установлена; выполните: sudo $0 install"
+}
+
+safe_name() {
+  local name="$1"
+  name="${name//[^[:alnum:]А-Яа-я._-]/_}"
+  while [[ "$name" == .* ]]; do name="${name#.}"; done
+  name="${name:0:64}"
+  [[ -n "$name" ]] || name="profile-$(date +%Y%m%d-%H%M%S)"
+  printf '%s' "$name"
+}
+
+profile_path() {
+  local name
+  name="$(safe_name "$1")"
+  printf '%s/%s.json' "$PROFILE_DIR" "$name"
+}
+
+is_xray_core() {
+  have xray && xray version 2>/dev/null | head -n 1 | grep -q '^Xray '
+}
+
+install_xray_core() {
+  local installer old_version="не установлен"
+  is_xray_core && old_version="$(xray version 2>/dev/null | head -n 1)"
+  say "Проверяю обновления Xray Core (сейчас: $old_version)…"
+  systemctl stop "$SERVICE" >/dev/null 2>&1 || true
+  installer="$(mktemp /tmp/xray-install.XXXXXX)"
+  if ! curl --fail --location --silent --show-error \
+      --proto '=https' --tlsv1.2 --retry 3 \
+      --output "$installer" \
+      https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh; then
+    rm -f -- "$installer"
+    die "не удалось скачать официальный установщик Xray Core"
+  fi
+  chmod 0700 "$installer"
+  if ! bash "$installer" install; then
+    rm -f -- "$installer"
+    die "официальный установщик Xray Core завершился с ошибкой"
+  fi
+  rm -f -- "$installer"
+  # Официальный установщик создаёт собственный сервис. Им управлять не нужно:
+  # профили запускаются изолированным xray-tui.service.
+  systemctl disable --now xray.service >/dev/null 2>&1 || true
+  hash -r
+  is_xray_core || die "Xray Core установился, но команда xray не найдена"
+  say "Готово: $(xray version 2>/dev/null | head -n 1)"
+}
+
+install_app() {
+  need_root install "$@"
+  local src xray_bin was_active=0
+  src="$(readlink -f "$0")"
+  have apt-get || die "установка поддерживается только на Debian/Ubuntu"
+  say "Устанавливаю зависимости…"
+  apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    python3 dialog curl iproute2 ca-certificates unzip openssl kmod
+  systemctl is-active --quiet "$SERVICE" 2>/dev/null && was_active=1
+  install_xray_core
+  xray_bin="$(command -v xray)"
+  install -d -m 0755 /usr/local/bin "$ETC_DIR" "$PROFILE_DIR"
+  [[ -f "$MODE_FILE" ]] || printf 'proxy\n' > "$MODE_FILE"
+  if [[ "$src" != "/usr/local/bin/xray-tui" ]]; then
+    install -m 0755 "$src" /usr/local/bin/xray-tui
+  fi
+  cat > /etc/systemd/system/$SERVICE <<EOF
+[Unit]
+Description=Xray connection managed by xray-tui
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=$ACTIVE_LINK
+StartLimitIntervalSec=30
+StartLimitBurst=3
+
+[Service]
+Type=simple
+ExecStart=$xray_bin run -c $ACTIVE_LINK
+ExecStartPost=/usr/local/bin/xray-tui tun-up
+ExecStopPost=/usr/local/bin/xray-tui tun-down
+Restart=on-failure
+RestartSec=3s
+LimitNOFILE=1048576
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=$ETC_DIR
+PrivateTmp=true
+RuntimeDirectory=xray-tui
+RuntimeDirectoryMode=0750
+ReadWritePaths=/run/xray-tui
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl reset-failed "$SERVICE" 2>/dev/null || true
+  if (( was_active )) && [[ -f "$ACTIVE_LINK" ]]; then
+    systemctl start "$SERVICE"
+  fi
+  say "Готово. Запуск: sudo xray-tui"
+}
+
+parse_uri() {
+  local uri="$1" fallback="$2"
+  FALLBACK_NAME="$fallback" SOCKS_PORT="$SOCKS_PORT" HTTP_PORT="$HTTP_PORT" python3 3<<<"$uri" <<'PY'
+import base64, json, os, sys
+from urllib.parse import urlsplit, parse_qs, unquote
+
+uri=os.fdopen(3).read().strip()
+fallback=os.environ.get('FALLBACK_NAME','').strip()
+socks=int(os.environ['SOCKS_PORT']); http=int(os.environ['HTTP_PORT'])
+
+def fail(msg): print('xray-tui: '+msg, file=sys.stderr); raise SystemExit(2)
+def b64(s):
+    s=s.strip().replace('-','+').replace('_','/')
+    try: return base64.b64decode(s+'='*((4-len(s)%4)%4)).decode()
+    except Exception: fail('некорректный base64 в ссылке')
+def one(q,k,default=''): return q.get(k,[default])[0]
+def stream(q):
+    net=one(q,'type','tcp'); sec=one(q,'security','none')
+    st={'network':net,'security':sec}
+    if sec in ('tls','reality'):
+        tls={'serverName':one(q,'sni') or one(q,'serverName'), 'allowInsecure':one(q,'allowInsecure','0') in ('1','true')}
+        if one(q,'alpn'): tls['alpn']=one(q,'alpn').split(',')
+        if one(q,'fp'): tls['fingerprint']=one(q,'fp')
+        if sec=='reality':
+            tls.update({'publicKey':one(q,'pbk'),'shortId':one(q,'sid'),'spiderX':one(q,'spx','/')})
+            st['realitySettings']=tls
+        else: st['tlsSettings']=tls
+    host=one(q,'host'); path=one(q,'path','/')
+    if net=='ws': st['wsSettings']={'path':path,'headers':({'Host':host} if host else {})}
+    elif net=='grpc': st['grpcSettings']={'serviceName':one(q,'serviceName') or one(q,'service')}
+    elif net=='httpupgrade': st['httpupgradeSettings']={'path':path,'host':host}
+    elif net in ('xhttp','splithttp'):
+        st['network']='xhttp'; st['xhttpSettings']={'path':path,'host':host,'mode':one(q,'mode','auto')}
+    elif net in ('h2','http'):
+        st['network']='h2'; st['httpSettings']={'path':path,'host':([host] if host else [])}
+    elif net=='kcp': st['kcpSettings']={'header':{'type':one(q,'headerType','none')},'seed':one(q,'seed')}
+    return st
+
+if uri.startswith('vmess://'):
+    raw=json.loads(b64(uri[8:])); proto='vmess'
+    host=str(raw.get('add','')); port=int(raw.get('port',0)); ident=str(raw.get('id',''))
+    name=fallback or raw.get('ps') or host
+    q={k:[str(v)] for k,v in {'type':raw.get('net','tcp'),'security':raw.get('tls','none') or 'none','sni':raw.get('sni',''),'host':raw.get('host',''),'path':raw.get('path','/'),'serviceName':raw.get('path',''),'fp':raw.get('fp','')}.items()}
+    user={'id':ident,'alterId':int(raw.get('aid',0)),'security':raw.get('scy','auto')}
+    outbound={'protocol':'vmess','settings':{'vnext':[{'address':host,'port':port,'users':[user]}]},'streamSettings':stream(q),'tag':'proxy'}
+else:
+    try: u=urlsplit(uri)
+    except Exception: fail('не удалось разобрать URI')
+    proto=u.scheme.lower(); q=parse_qs(u.query,keep_blank_values=True)
+    if proto not in ('vless','trojan','ss'): fail('поддерживаются vless://, vmess://, trojan:// и ss://')
+    name=fallback or unquote(u.fragment) or (u.hostname or 'profile')
+    if proto=='ss':
+        # SIP002: ss://base64(method:password)@host:port or whole authority in base64
+        try:
+            if u.hostname and u.port:
+                auth=unquote(u.username or '')
+                if ':' not in auth: auth=b64(auth)
+                method,password=auth.split(':',1); host=u.hostname; port=u.port
+            else:
+                decoded=b64(uri[5:].split('#',1)[0].split('?',1)[0]); auth,addr=decoded.rsplit('@',1)
+                method,password=auth.split(':',1); host,port=addr.rsplit(':',1); port=int(port.strip('[]'))
+        except Exception: fail('некорректная Shadowsocks-ссылка')
+        outbound={'protocol':'shadowsocks','settings':{'servers':[{'address':host,'port':port,'method':method,'password':password}]},'tag':'proxy'}
+    else:
+        host=u.hostname or ''; port=u.port or 0; secret=unquote(u.username or '')
+        if not host or not port or not secret: fail('в ссылке отсутствует сервер, порт или ключ')
+        if proto=='vless':
+            user={'id':secret,'encryption':one(q,'encryption','none')}
+            if one(q,'flow'): user['flow']=one(q,'flow')
+            if one(q,'packetEncoding'): user['packetEncoding']=one(q,'packetEncoding')
+            settings={'vnext':[{'address':host,'port':port,'users':[user]}]}
+        else: settings={'servers':[{'address':host,'port':port,'password':secret}]}
+        outbound={'protocol':proto,'settings':settings,'streamSettings':stream(q),'tag':'proxy'}
+
+if not host or not port: fail('в ссылке отсутствует сервер или порт')
+cfg={
+ 'log':{'loglevel':'warning'},
+ 'dns':{'servers':['https+local://1.1.1.1/dns-query','localhost']},
+ 'inbounds':[
+   {'tag':'socks-in','listen':'127.0.0.1','port':socks,'protocol':'socks','settings':{'udp':True}},
+   {'tag':'http-in','listen':'127.0.0.1','port':http,'protocol':'http'}],
+ 'outbounds':[outbound,{'protocol':'freedom','tag':'direct'},{'protocol':'blackhole','tag':'block'}],
+ 'routing':{'domainStrategy':'IPIfNonMatch','rules':[
+   {'type':'field','ip':['geoip:private'],'outboundTag':'direct'},
+   {'type':'field','protocol':['bittorrent'],'outboundTag':'direct'}]}}
+print(json.dumps({'name':name,'config':cfg},ensure_ascii=False))
+PY
+}
+
+import_profile() {
+  need_runtime
+  local uri="${1:-}" requested="${2:-}" parsed name cfg tmp target
+  if [[ -z "$uri" ]]; then
+    if [[ -t 0 ]]; then read -r -p "Вставьте URI подключения: " uri; else IFS= read -r uri; fi
+  fi
+  [[ -n "$uri" ]] || die "пустая ссылка"
+  parsed="$(parse_uri "$uri" "$requested")" || exit $?
+  name="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])' <<<"$parsed")"
+  name="$(safe_name "$name")"
+  cfg="$(python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["config"],ensure_ascii=False,indent=2))' <<<"$parsed")"
+  target="$(profile_path "$name")"
+  if [[ -e "$target" ]]; then
+    if [[ -t 0 ]]; then read -r -p "Профиль '$name' уже существует. Заменить? [y/N] " requested; [[ "$requested" =~ ^[YyДд]$ ]] || return 1
+    else die "профиль '$name' уже существует"; fi
+  fi
+  # Современные версии Xray выбирают парсер конфигурации по расширению файла.
+  tmp="$(mktemp --suffix=.json "$PROFILE_DIR/.import.XXXXXX")"
+  chmod 0600 "$tmp"
+  printf '%s\n' "$cfg" > "$tmp"
+  if ! xray run -test -c "$tmp"; then rm -f -- "$tmp"; die "Xray отклонил конфигурацию"; fi
+  mv -f -- "$tmp" "$target"
+  chmod 0600 "$target"
+  say "Импортирован профиль: $name"
+}
+
+list_profiles() {
+  need_runtime
+  local active="" f n mark
+  [[ -f "$ACTIVE_NAME" ]] && active="$(<"$ACTIVE_NAME")"
+  shopt -s nullglob
+  for f in "$PROFILE_DIR"/*.json; do
+    n="$(basename "$f" .json)"; mark=" "
+    [[ "$n" == "$active" ]] && mark="*"
+    printf '%s %s\n' "$mark" "$n"
+  done
+}
+
+current_mode() {
+  local mode="proxy"
+  [[ -f "$MODE_FILE" ]] && mode="$(<"$MODE_FILE")"
+  [[ "$mode" == "tun" ]] || mode="proxy"
+  printf '%s' "$mode"
+}
+
+render_active_config() {
+  local profile="$1" mode="$2"
+  python3 - "$profile" "$mode" <<'PY'
+import json, sys
+
+profile, mode = sys.argv[1:]
+with open(profile, encoding='utf-8') as f:
+    cfg = json.load(f)
+
+if mode == 'tun':
+    tun = {
+        'tag': 'tun-in',
+        'protocol': 'tun',
+        'settings': {
+            'name': 'xray0',
+            'MTU': 1500
+        },
+        'sniffing': {
+            'enabled': True,
+            'destOverride': ['http', 'tls', 'quic']
+        }
+    }
+    cfg.setdefault('inbounds', []).append(tun)
+    # В TUN-режиме BitTorrent также должен идти через выбранный сервер.
+    rules = cfg.get('routing', {}).get('rules', [])
+    cfg['routing']['rules'] = [r for r in rules if r.get('protocol') != ['bittorrent']]
+
+json.dump(cfg, sys.stdout, ensure_ascii=False, indent=2)
+print()
+PY
+}
+
+build_active_config() {
+  local profile="$1" mode="$2" tmp
+  tmp="$(mktemp --suffix=.json "$ETC_DIR/.active.XXXXXX")"
+  chmod 0600 "$tmp"
+  if ! render_active_config "$profile" "$mode" > "$tmp"; then
+    rm -f -- "$tmp"
+    err "не удалось собрать активную конфигурацию"
+    return 1
+  fi
+  if ! xray run -test -c "$tmp"; then
+    rm -f -- "$tmp"
+    err "Xray отклонил конфигурацию режима '$mode'"
+    return 1
+  fi
+  mv -f -- "$tmp" "$ACTIVE_LINK"
+  chmod 0600 "$ACTIVE_LINK"
+}
+
+ensure_tun_available() {
+  [[ -c /dev/net/tun ]] || modprobe tun 2>/dev/null || true
+  [[ -c /dev/net/tun ]] || die "устройство /dev/net/tun недоступно (проверьте поддержку TUN ядром или настройку VPS/контейнера)"
+}
+
+tun_down() {
+  local kind family pref dest table path value
+  [[ -f "$TUN_STATE" ]] || return 0
+  while IFS='|' read -r kind family pref dest table; do
+    case "$kind" in
+      rule)
+        if [[ "$family" == "4" ]]; then
+          ip -4 rule del pref "$pref" to "$dest" lookup "$table" 2>/dev/null || true
+        else
+          ip -6 rule del pref "$pref" to "$dest" lookup "$table" 2>/dev/null || true
+        fi
+        ;;
+      sysctl)
+        path="$family"; value="$pref"
+        [[ -w "$path" ]] && printf '%s\n' "$value" > "$path" || true
+        ;;
+    esac
+  done < "$TUN_STATE"
+  ip -4 route flush table "$TUN_TABLE" 2>/dev/null || true
+  ip -6 route flush table "$TUN_TABLE" 2>/dev/null || true
+  rm -f -- "$TUN_STATE"
+}
+
+tun_up() {
+  [[ "$(current_mode)" == "tun" ]] || return 0
+  ensure_tun_available
+  local i default4 iface pref host ipaddr old path
+  local -a servers4=() servers6=()
+
+  tun_down
+  for i in {1..30}; do
+    ip link show dev "$TUN_NAME" >/dev/null 2>&1 && break
+    sleep 0.1
+  done
+  ip link show dev "$TUN_NAME" >/dev/null 2>&1 || die "интерфейс $TUN_NAME не появился"
+
+  default4="$(ip -4 route show default | head -n 1)"
+  iface="$(awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}' <<<"$default4")"
+  [[ -n "$iface" && "$iface" != "$TUN_NAME" ]] || die "не удалось определить физический сетевой интерфейс"
+
+  mapfile -t servers4 < <(
+    while IFS= read -r host; do getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}'; done < <(python3 - "$ACTIVE_LINK" <<'PY'
+import json,sys
+d=json.load(open(sys.argv[1]))
+for out in d.get('outbounds',[]):
+    if out.get('tag') != 'proxy': continue
+    for group in ('vnext','servers'):
+        for server in out.get('settings',{}).get(group,[]):
+            if server.get('address'): print(server['address'])
+PY
+    ) | sort -u
+  )
+  mapfile -t servers6 < <(
+    while IFS= read -r host; do getent ahostsv6 "$host" 2>/dev/null | awk '{print $1}'; done < <(python3 - "$ACTIVE_LINK" <<'PY'
+import json,sys
+d=json.load(open(sys.argv[1]))
+for out in d.get('outbounds',[]):
+    if out.get('tag') != 'proxy': continue
+    for group in ('vnext','servers'):
+        for server in out.get('settings',{}).get(group,[]):
+            if server.get('address'): print(server['address'])
+PY
+    ) | sort -u
+  )
+  ((${#servers4[@]} + ${#servers6[@]} > 0)) || die "не удалось определить IP VPN-сервера до изменения маршрутов"
+
+  umask 077
+  : > "$TUN_STATE"
+  ip address replace 198.18.0.1/30 dev "$TUN_NAME"
+  ip -6 address replace fd00::1/126 dev "$TUN_NAME" 2>/dev/null || true
+  ip link set dev "$TUN_NAME" up
+
+  # Отключаем reverse-path filtering на время работы TUN и восстанавливаем его позже.
+  for path in /proc/sys/net/ipv4/conf/all/rp_filter "/proc/sys/net/ipv4/conf/$iface/rp_filter"; do
+    if [[ -r "$path" && -w "$path" ]]; then
+      old="$(<"$path")"; printf 'sysctl|%s|%s||\n' "$path" "$old" >> "$TUN_STATE"; printf '0\n' > "$path"
+    fi
+  done
+
+  ip -4 route replace table "$TUN_TABLE" default dev "$TUN_NAME"
+  ip -6 route replace table "$TUN_TABLE" default dev "$TUN_NAME" 2>/dev/null || true
+
+  pref=20000
+  for ipaddr in "${servers4[@]}"; do
+    ip -4 rule add pref "$pref" to "$ipaddr/32" lookup main
+    printf 'rule|4|%s|%s/32|main\n' "$pref" "$ipaddr" >> "$TUN_STATE"; ((pref+=1))
+  done
+  pref=20000
+  for ipaddr in "${servers6[@]}"; do
+    ip -6 rule add pref "$pref" to "$ipaddr/128" lookup main
+    printf 'rule|6|%s|%s/128|main\n' "$pref" "$ipaddr" >> "$TUN_STATE"; ((pref+=1))
+  done
+
+  pref=21000
+  for dest in 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 224.0.0.0/4; do
+    ip -4 rule add pref "$pref" to "$dest" lookup main
+    printf 'rule|4|%s|%s|main\n' "$pref" "$dest" >> "$TUN_STATE"; ((pref+=1))
+  done
+  pref=21000
+  for dest in ::1/128 fc00::/7 fe80::/10 ff00::/8; do
+    ip -6 rule add pref "$pref" to "$dest" lookup main 2>/dev/null || continue
+    printf 'rule|6|%s|%s|main\n' "$pref" "$dest" >> "$TUN_STATE"; ((pref+=1))
+  done
+  ip -4 rule add pref 22000 lookup "$TUN_TABLE"
+  printf 'rule|4|22000|all|%s\n' "$TUN_TABLE" >> "$TUN_STATE"
+  if ip -6 rule add pref 22000 lookup "$TUN_TABLE" 2>/dev/null; then
+    printf 'rule|6|22000|all|%s\n' "$TUN_TABLE" >> "$TUN_STATE"
+  fi
+  ip -4 route flush cache 2>/dev/null || true
+  ip -6 route flush cache 2>/dev/null || true
+}
+
+set_mode() {
+  need_runtime
+  local mode="${1:-}" active="" was_active=0 path
+  [[ "$mode" == "proxy" || "$mode" == "tun" ]] || die "использование: xray-tui mode proxy|tun"
+  [[ "$mode" != "tun" ]] || ensure_tun_available
+  systemctl is-active --quiet "$SERVICE" && was_active=1
+  (( was_active )) && systemctl stop "$SERVICE"
+  if [[ -f "$ACTIVE_NAME" ]]; then
+    active="$(<"$ACTIVE_NAME")"; path="$(profile_path "$active")"
+    if [[ -f "$path" ]] && ! build_active_config "$path" "$mode"; then
+      (( was_active )) && systemctl start "$SERVICE" || true
+      die "не удалось переключить режим; прежнее подключение восстановлено"
+    fi
+  fi
+  printf '%s\n' "$mode" > "$MODE_FILE"
+  if (( was_active )); then
+    systemctl start "$SERVICE"
+    sleep 1
+    if ! systemctl is-active --quiet "$SERVICE"; then
+      journalctl -u "$SERVICE" -n 20 --no-pager >&2
+      die "Xray не запустился в режиме '$mode'"
+    fi
+  fi
+  if [[ "$mode" == "tun" ]]; then
+    say "Режим TUN включён: весь системный IPv4/IPv6-трафик пойдёт через Xray"
+  else
+    say "Режим Proxy включён: SOCKS5 127.0.0.1:$SOCKS_PORT, HTTP 127.0.0.1:$HTTP_PORT"
+  fi
+}
+
+up_profile() {
+  need_runtime
+  local name path mode was_active=0
+  name="$(safe_name "${1:?укажите профиль}")"; path="$(profile_path "$name")"
+  [[ -f "$path" ]] || die "профиль '$name' не найден"
+  mode="$(current_mode)"
+  [[ "$mode" != "tun" ]] || ensure_tun_available
+  systemctl is-active --quiet "$SERVICE" && was_active=1
+  (( was_active )) && systemctl stop "$SERVICE"
+  if ! build_active_config "$path" "$mode"; then
+    (( was_active )) && systemctl start "$SERVICE" || true
+    die "не удалось переключить профиль; прежнее подключение восстановлено"
+  fi
+  printf '%s\n' "$name" > "$ACTIVE_NAME"
+  systemctl start "$SERVICE"
+  sleep 1
+  if systemctl is-active --quiet "$SERVICE"; then say "Подключено: $name (режим: $mode)"; else
+    journalctl -u "$SERVICE" -n 15 --no-pager >&2
+    die "Xray не запустился"
+  fi
+}
+
+down_profile() { need_runtime; systemctl stop "$SERVICE"; say "Отключено"; }
+
+status_cmd() {
+  need_runtime
+  local active="нет" enabled="нет" state="отключено" mode
+  mode="$(current_mode)"
+  [[ -f "$ACTIVE_NAME" ]] && active="$(<"$ACTIVE_NAME")"
+  systemctl is-active --quiet "$SERVICE" && state="подключено"
+  systemctl is-enabled --quiet "$SERVICE" 2>/dev/null && enabled="да"
+  printf 'Состояние: %s\nПрофиль:   %s\nРежим:     %s\nАвтозапуск: %s\nSOCKS5:    127.0.0.1:%s\nHTTP:      127.0.0.1:%s\n' "$state" "$active" "$mode" "$enabled" "$SOCKS_PORT" "$HTTP_PORT"
+  systemctl show "$SERVICE" -p MainPID -p ActiveEnterTimestamp 2>/dev/null | sed '/MainPID=0/d;/=$/d' || true
+  if have ss; then ss -lntup 2>/dev/null | awk -v s=":$SOCKS_PORT" -v h=":$HTTP_PORT" 'index($0,s)||index($0,h)' || true; fi
+  if [[ "$mode" == "tun" ]] && have ip; then
+    ip -brief address show dev xray0 2>/dev/null || true
+    ip route show table all dev xray0 2>/dev/null || true
+  fi
+}
+
+probe_cmd() {
+  need_runtime
+  local mode
+  mode="$(current_mode)"
+  systemctl is-active --quiet "$SERVICE" || die "подключение не активно"
+  have curl || die "не найден curl"
+  if [[ "$mode" == "tun" ]]; then
+    say "Проверяю системный трафик через TUN…"
+    curl --fail --silent --show-error --max-time 12 --noproxy '*' https://www.cloudflare.com/cdn-cgi/trace
+  else
+    say "Проверяю доступ через SOCKS5…"
+    curl --fail --silent --show-error --max-time 12 --proxy "socks5h://127.0.0.1:$SOCKS_PORT" https://www.cloudflare.com/cdn-cgi/trace
+  fi | awk -F= '$1=="ip"||$1=="loc"||$1=="warp"{print}'
+}
+
+show_profile() {
+  need_runtime
+  local path; path="$(profile_path "${1:?укажите профиль}")"
+  [[ -f "$path" ]] || die "профиль не найден"
+  python3 - "$path" <<'PY'
+import json,sys
+d=json.load(open(sys.argv[1]))
+for out in d.get('outbounds',[]):
+    s=out.get('settings',{})
+    for group in ('vnext','servers'):
+        for server in s.get(group,[]):
+            for k in ('password','id'): 
+                if k in server: server[k]='***'
+            for user in server.get('users',[]):
+                for k in ('password','id'): 
+                    if k in user: user[k]='***'
+print(json.dumps(d,ensure_ascii=False,indent=2))
+PY
+}
+
+delete_profile() {
+  need_runtime
+  local name path active=""
+  name="$(safe_name "${1:?укажите профиль}")"; path="$(profile_path "$name")"
+  [[ -f "$path" ]] || die "профиль не найден"
+  [[ -f "$ACTIVE_NAME" ]] && active="$(<"$ACTIVE_NAME")"
+  if [[ "$name" == "$active" ]]; then
+    systemctl is-active --quiet "$SERVICE" && die "сначала отключите или переключите активный профиль"
+    rm -f -- "$ACTIVE_LINK" "$ACTIVE_NAME"
+  fi
+  rm -f -- "$path"
+  say "Удалён профиль: $name"
+}
+
+autostart_cmd() {
+  need_runtime
+  case "${1:-}" in
+    on) [[ -f "$ACTIVE_LINK" ]] || die "сначала выберите профиль"; systemctl enable "$SERVICE"; say "Автозапуск включён" ;;
+    off) systemctl disable "$SERVICE"; say "Автозапуск выключен" ;;
+    *) die "использование: xray-tui autostart on|off" ;;
+  esac
+}
+
+choose_profile() {
+  local title="$1" items=() f n active=""
+  [[ -f "$ACTIVE_NAME" ]] && active="$(<"$ACTIVE_NAME")"
+  shopt -s nullglob
+  for f in "$PROFILE_DIR"/*.json; do n="$(basename "$f" .json)"; items+=("$n" "$([[ "$n" == "$active" ]] && echo активный || echo профиль)"); done
+  ((${#items[@]})) || return 1
+  dialog --stdout --title "$title" --menu "Выберите профиль" 20 72 12 "${items[@]}"
+}
+
+tui() {
+  need_runtime
+  have dialog || die "не найден dialog; выполните: apt install dialog"
+  local choice uri name output log_file mode
+  while true; do
+    mode="$(current_mode)"
+    choice="$(dialog --stdout --clear --title "Xray TUI $VERSION — режим: $mode" --menu "Управление подключением Xray" 22 82 12 \
+      1 "Подключить / переключить профиль" \
+      2 "Отключиться" \
+      3 "Выбрать режим: Proxy или системный TUN" \
+      4 "Импортировать URI" \
+      5 "Состояние" \
+      6 "Проверить внешний IP" \
+      7 "Журнал Xray" \
+      8 "Удалить профиль" \
+      9 "Включить автозапуск" \
+      10 "Выключить автозапуск" \
+      0 "Выход")" || break
+    case "$choice" in
+      1)
+        name="$(choose_profile "Подключение")" || continue
+        output="$(up_profile "$name" 2>&1)" || true
+        dialog --msgbox "$output" 12 76
+        ;;
+      2) output="$(down_profile 2>&1)"; dialog --msgbox "$output" 8 60 ;;
+      3)
+        mode="$(dialog --stdout --title "Режим подключения" --menu "Proxy затрагивает только настроенные приложения. TUN направляет весь системный трафик." 14 90 4 \
+          proxy "SOCKS5/HTTP на localhost" \
+          tun "Полный системный IPv4/IPv6-туннель")" || continue
+        output="$(set_mode "$mode" 2>&1)" || true
+        dialog --msgbox "$output" 12 86
+        ;;
+      4) uri="$(dialog --stdout --inputbox "Вставьте vless://, vmess://, trojan:// или ss:// ссылку" 11 100)" || continue; output="$(import_profile "$uri" 2>&1)" || true; dialog --msgbox "$output" 12 80 ;;
+      5) output="$(status_cmd 2>&1)"; dialog --msgbox "$output" 20 92 ;;
+      6) output="$(probe_cmd 2>&1)" || true; dialog --msgbox "$output" 12 70 ;;
+      7)
+        log_file="$(mktemp)"
+        journalctl -u "$SERVICE" -n 200 --no-pager > "$log_file"
+        dialog --title "Журнал Xray" --textbox "$log_file" 28 100
+        rm -f -- "$log_file"
+        ;;
+      8) name="$(choose_profile "Удаление")" || continue; if dialog --yesno "Удалить профиль '$name'?" 8 60; then output="$(delete_profile "$name" 2>&1)" || true; dialog --msgbox "$output" 9 70; fi ;;
+      9) output="$(autostart_cmd on 2>&1)" || true; dialog --msgbox "$output" 8 60 ;;
+      10) output="$(autostart_cmd off 2>&1)" || true; dialog --msgbox "$output" 8 60 ;;
+      0) break ;;
+    esac
+  done
+  clear
+}
+
+main() {
+  local cmd="${1:-tui}"; [[ $# -gt 0 ]] && shift
+  case "$cmd" in
+    -h|--help|help) usage ;;
+    --version|version) say "$VERSION" ;;
+    install) install_app "$@" ;;
+    tui) need_root "$cmd" "$@"; tui ;;
+    import|add) need_root "$cmd" "$@"; import_profile "$@" ;;
+    list) need_root "$cmd" "$@"; list_profiles ;;
+    up|connect) need_root "$cmd" "$@"; up_profile "$@" ;;
+    mode) need_root "$cmd" "$@"; set_mode "$@" ;;
+    down|disconnect) need_root "$cmd" "$@"; down_profile ;;
+    status) need_root "$cmd" "$@"; status_cmd ;;
+    probe|check) need_root "$cmd" "$@"; probe_cmd ;;
+    logs) need_root "$cmd" "$@"; need_runtime; journalctl -u "$SERVICE" -n "${1:-100}" --no-pager ;;
+    show) need_root "$cmd" "$@"; show_profile "$@" ;;
+    delete|rm) need_root "$cmd" "$@"; delete_profile "$@" ;;
+    autostart) need_root "$cmd" "$@"; autostart_cmd "$@" ;;
+    tun-up) need_root "$cmd" "$@"; tun_up ;;
+    tun-down) need_root "$cmd" "$@"; tun_down ;;
+    *) usage >&2; exit 2 ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
