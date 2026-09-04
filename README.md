@@ -3,7 +3,9 @@
 Текстовый менеджер профилей Xray для Debian. Импортирует ссылки `vless://`,
 `vmess://`, `trojan://` и `ss://`, проверяет конфигурацию средствами Xray,
 переключает профили через systemd и показывает состояние и журнал. Поддерживает
-локальный Proxy и полноценный системный TUN.
+локальный Proxy, полноценный системный TUN и подписки на списки серверов.
+Интерфейс автоматически переключается между русским и английским по языку
+системы. Для новых установок режим TUN выбран по умолчанию.
 
 ## Установка
 
@@ -15,9 +17,10 @@ sudo xray-tui
 
 Установщик автоматически ставит `python3`, `dialog`, `curl`, `iproute2`,
 сертификаты и прочие зависимости через `apt`. Если Xray Core отсутствует, он
-загружается вместе с geodata официальным установщиком проекта XTLS. При повторной
-установке Core обновляется до актуальной стабильной версии, необходимой для
-автоматического TUN. Архитектура определяется автоматически; архив Xray
+загружается вместе с geodata официальным установщиком проекта XTLS. Уже
+установленный исправный Core повторно не скачивается, поэтому обновление
+`xray-tui` не зависит от доступности GitHub Releases. При первой установке
+сетевые ошибки повторяются до трёх раз. Архитектура определяется автоматически; архив Xray
 проверяется штатными контрольными суммами официального установщика.
 Созданный им стандартный `xray.service` отключается, поскольку профилями управляет
 отдельный `xray-tui.service`.
@@ -26,6 +29,9 @@ sudo xray-tui
 
 ```bash
 sudo xray-tui import 'vless://…'
+sudo xray-tui subscription add main 'https://example.com/subscription'
+sudo xray-tui subscription refresh main
+sudo xray-tui subscription list
 sudo xray-tui list
 sudo xray-tui up имя-профиля
 sudo xray-tui mode tun
@@ -43,6 +49,53 @@ sudo xray-tui down
 Профили находятся в `/etc/xray-tui/profiles` с правами `0600`. Перед
 сохранением и каждым запуском выполняется `xray run -test`.
 
+## Подписки
+
+Откройте пункт «Управление подписками» в TUI или добавьте источник командой:
+
+```bash
+sudo xray-tui subscription add NAME URL
+```
+
+Поддерживаются обычные и Base64-кодированные списки ссылок `vless://`,
+`vmess://`, `trojan://` и `ss://`. Каждый корректный сервер становится отдельным
+профилем с префиксом подписки и появляется в общем меню подключения.
+
+```bash
+sudo xray-tui subscription refresh NAME  # обновить одну
+sudo xray-tui subscription refresh       # обновить все
+sudo xray-tui subscription list
+sudo xray-tui subscription delete NAME
+```
+
+При обновлении исчезнувшие серверы удаляются. Активный профиль сохраняется до
+переключения, чтобы обновление подписки не обрывало текущее соединение. URL и
+списки профилей хранятся в `/etc/xray-tui/subscriptions` с правами `0600`.
+
+## Язык интерфейса
+
+Для локалей `ru*` используется русский язык, для остальных — английский.
+Язык можно переопределить независимо от системной локали:
+
+```bash
+XRAY_TUI_LANG=ru sudo -E xray-tui
+XRAY_TUI_LANG=en sudo -E xray-tui
+```
+
+## Обновление программы
+
+Проверить ветку `main` репозитория `RxtPR/xray-tui`:
+
+```bash
+sudo xray-tui update --check
+sudo xray-tui update
+```
+
+Для установки без интерактивного подтверждения используйте
+`sudo xray-tui update --yes`. Эта же функция доступна через пункт «Проверить
+обновления» в главном меню. Перед установкой проверяются идентификатор проекта,
+номер версии и Bash-синтаксис загруженного файла. Понижение версии блокируется.
+
 ## Режимы подключения
 
 Режим выбирается в TUI или командой:
@@ -51,6 +104,10 @@ sudo xray-tui down
 sudo xray-tui mode proxy
 sudo xray-tui mode tun
 ```
+
+На новой установке по умолчанию используется `tun`. Выбранный режим сохраняется
+между запусками. Чтобы изменить начальное значение при автоматической установке,
+задайте `XRAY_TUI_DEFAULT_MODE=proxy`.
 
 В режиме `proxy` Xray слушает только localhost:
 
@@ -92,6 +149,8 @@ sudo systemctl daemon-reload
 generated configurations with Xray Core, switches profiles through systemd,
 and provides status and journal views. Both local proxy and system-wide TUN
 modes are supported.
+The interface automatically selects Russian or English based on the system
+locale. New installations use TUN mode by default.
 
 ## Features
 
@@ -100,6 +159,7 @@ modes are supported.
 - TLS, REALITY, TCP, WebSocket, gRPC, HTTPUpgrade, XHTTP/SplitHTTP, HTTP/2,
   and mKCP support.
 - Multiple named profiles with safe permissions.
+- Plain-text and Base64 subscription support with per-server selection.
 - Local SOCKS5 and HTTP proxy mode.
 - System-wide IPv4/IPv6 TUN mode.
 - systemd integration and optional startup at boot.
@@ -116,8 +176,10 @@ sudo xray-tui
 
 The installer uses `apt` to install Python 3, `dialog`, `curl`, `iproute2`, CA
 certificates, and other required packages. It downloads Xray Core and geodata
-using the official XTLS installer. The machine architecture and current stable
-release are detected automatically, and upstream checksums are used to verify
+using the official XTLS installer when Core is not already available. An
+existing working Core is not downloaded again, so updating `xray-tui` does not
+depend on GitHub Releases availability. First-time network failures are retried
+up to three times. The machine architecture is detected automatically, and upstream checksums are used to verify
 the downloaded Xray archive.
 
 The default `xray.service` created by the upstream installer is disabled because
@@ -127,6 +189,8 @@ profiles are managed by the dedicated `xray-tui.service` unit.
 
 ```bash
 sudo xray-tui import 'vless://…'
+sudo xray-tui subscription add main 'https://example.com/subscription'
+sudo xray-tui subscription refresh main
 sudo xray-tui list
 sudo xray-tui up profile-name
 sudo xray-tui mode tun
@@ -150,6 +214,55 @@ Profiles are stored in `/etc/xray-tui/profiles` with `0600` permissions. Every
 generated configuration is checked with `xray run -test` before it is saved or
 activated.
 
+## Subscriptions
+
+Open **Subscription management** in the TUI or add a source from the command
+line:
+
+```bash
+sudo xray-tui subscription add NAME URL
+```
+
+Plain-text and Base64-encoded lists containing `vless://`, `vmess://`,
+`trojan://`, and `ss://` URIs are supported. Every valid server becomes a named
+profile with a subscription prefix and appears in the regular connection menu.
+
+```bash
+sudo xray-tui subscription refresh NAME  # update one subscription
+sudo xray-tui subscription refresh       # update all subscriptions
+sudo xray-tui subscription list
+sudo xray-tui subscription delete NAME
+```
+
+Servers removed upstream are removed locally during refresh. An active profile
+is retained until another one is selected, preventing a subscription refresh
+from interrupting the current connection. Subscription URLs and profile indexes
+are stored under `/etc/xray-tui/subscriptions` with `0600` permissions.
+
+## Interface language
+
+Russian is selected for `ru*` locales; all other locales use English. Override
+the detected language independently of the system locale with:
+
+```bash
+XRAY_TUI_LANG=ru sudo -E xray-tui
+XRAY_TUI_LANG=en sudo -E xray-tui
+```
+
+## Application updates
+
+Check the `main` branch of `RxtPR/xray-tui`:
+
+```bash
+sudo xray-tui update --check
+sudo xray-tui update
+```
+
+Use `sudo xray-tui update --yes` to install without an interactive confirmation.
+The same action is available through **Check for updates** in the main menu.
+Before installation, the downloaded file is checked for the project marker,
+version format, and valid Bash syntax. Downgrades are refused.
+
 ## Connection modes
 
 Select a mode from the TUI or use the command line:
@@ -158,6 +271,10 @@ Select a mode from the TUI or use the command line:
 sudo xray-tui mode proxy
 sudo xray-tui mode tun
 ```
+
+New installations default to `tun`, and the selected mode persists across
+restarts. Set `XRAY_TUI_DEFAULT_MODE=proxy` to change the initial value during
+automated installation.
 
 ### Proxy mode
 

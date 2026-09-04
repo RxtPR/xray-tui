@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="0.3.3"
+VERSION="0.0.2"
 APP="xray-tui"
+UPDATE_URL="${XRAY_TUI_UPDATE_URL:-https://raw.githubusercontent.com/RxtPR/xray-tui/main/xray-tui}"
 ETC_DIR="${XRAY_TUI_ETC:-/etc/xray-tui}"
 PROFILE_DIR="$ETC_DIR/profiles"
+SUB_DIR="$ETC_DIR/subscriptions"
 ACTIVE_LINK="$ETC_DIR/active.json"
 ACTIVE_NAME="$ETC_DIR/active-profile"
 MODE_FILE="$ETC_DIR/mode"
@@ -14,19 +16,59 @@ TUN_TABLE="20220"
 TUN_STATE="/run/xray-tui/tun.state"
 SOCKS_PORT="${XRAY_TUI_SOCKS_PORT:-10808}"
 HTTP_PORT="${XRAY_TUI_HTTP_PORT:-10809}"
+DEFAULT_MODE="${XRAY_TUI_DEFAULT_MODE:-tun}"
+[[ "$DEFAULT_MODE" == "proxy" || "$DEFAULT_MODE" == "tun" ]] || DEFAULT_MODE="tun"
+SYSTEM_LOCALE="${XRAY_TUI_LANG:-${LC_ALL:-${LC_MESSAGES:-${LANG:-en}}}}"
+case "${SYSTEM_LOCALE,,}" in ru*) UI_LANG="ru" ;; *) UI_LANG="en" ;; esac
 
 say() { printf '%s\n' "$*"; }
 err() { printf 'xray-tui: %s\n' "$*" >&2; }
 die() { err "$*"; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
+l10n() {
+  local ru="$1" en="$2" format
+  shift 2
+  if [[ "$UI_LANG" == "ru" ]]; then format="$ru"; else format="$en"; fi
+  printf "$format" "$@"
+}
 
 usage() {
+  if [[ "$UI_LANG" == "en" ]]; then
+    cat <<EOF
+xray-tui $VERSION — Xray connection manager for Debian
+
+Usage:
+  sudo xray-tui                    open the interactive menu
+  sudo xray-tui import [URI]       import a vless/vmess/trojan/ss URI
+  sudo xray-tui subscription add NAME [URL]
+  sudo xray-tui subscription refresh [NAME]
+  sudo xray-tui subscription list|delete [NAME]
+  sudo xray-tui list               list profiles
+  sudo xray-tui up NAME            connect a profile
+  sudo xray-tui mode proxy|tun     select local proxy or system-wide TUN
+  sudo xray-tui down               disconnect
+  sudo xray-tui status             show connection status
+  sudo xray-tui probe              check the external IP in the current mode
+  sudo xray-tui logs [LINES]       show the journal
+  sudo xray-tui show NAME          print a redacted profile JSON
+  sudo xray-tui delete NAME        delete a profile
+  sudo xray-tui autostart on|off   control startup at boot
+  sudo xray-tui update [--check]   check for and install updates
+  sudo ./xray-tui install          install the application and systemd service
+
+Local proxies: SOCKS5 127.0.0.1:$SOCKS_PORT, HTTP 127.0.0.1:$HTTP_PORT
+EOF
+    return
+  fi
   cat <<EOF
 xray-tui $VERSION — менеджер подключений Xray для Debian
 
 Использование:
   sudo xray-tui                    открыть интерактивное меню
   sudo xray-tui import [URI]       импортировать vless/vmess/trojan/ss ссылку
+  sudo xray-tui subscription add NAME [URL]
+  sudo xray-tui subscription refresh [NAME]
+  sudo xray-tui subscription list|delete [NAME]
   sudo xray-tui list               список профилей
   sudo xray-tui up NAME            подключить профиль
   sudo xray-tui mode proxy|tun     выбрать локальный прокси или системный TUN
@@ -37,6 +79,7 @@ xray-tui $VERSION — менеджер подключений Xray для Debian
   sudo xray-tui show NAME          вывести JSON профиля без секретов
   sudo xray-tui delete NAME        удалить профиль
   sudo xray-tui autostart on|off   автозапуск активного профиля
+  sudo xray-tui update [--check]   проверить и установить обновление
   sudo ./xray-tui install          установить программу и systemd service
 
 Прокси после подключения: SOCKS5 127.0.0.1:$SOCKS_PORT, HTTP 127.0.0.1:$HTTP_PORT
@@ -46,13 +89,13 @@ EOF
 need_root() {
   (( EUID == 0 )) && return
   if have sudo; then exec sudo -- "$0" "$@"; fi
-  die "эта команда требует root (запустите через sudo)"
+  die "$(l10n 'эта команда требует root (запустите через sudo)' 'this command requires root (run it with sudo)')"
 }
 
 need_runtime() {
-  have python3 || die "не найден python3"
-  have systemctl || die "не найден systemctl"
-  [[ -d "$PROFILE_DIR" ]] || die "программа не установлена; выполните: sudo $0 install"
+  have python3 || die "$(l10n 'не найден python3' 'python3 was not found')"
+  have systemctl || die "$(l10n 'не найден systemctl' 'systemctl was not found')"
+  [[ -d "$PROFILE_DIR" ]] || die "$(l10n 'программа не установлена; выполните: sudo %s install' 'the application is not installed; run: sudo %s install' "$0")"
 }
 
 safe_name() {
@@ -75,9 +118,15 @@ is_xray_core() {
 }
 
 install_xray_core() {
-  local installer old_version="не установлен"
-  is_xray_core && old_version="$(xray version 2>/dev/null | head -n 1)"
-  say "Проверяю обновления Xray Core (сейчас: $old_version)…"
+  local installer old_version attempt installed=0
+  old_version="$(l10n 'не установлен' 'not installed')"
+  if is_xray_core; then
+    installed=1
+    old_version="$(xray version 2>/dev/null | head -n 1)"
+    say "$(l10n 'Xray Core уже установлен: %s' 'Xray Core is already installed: %s' "$old_version")"
+    return 0
+  fi
+  say "$(l10n 'Устанавливаю Xray Core…' 'Installing Xray Core…')"
   systemctl stop "$SERVICE" >/dev/null 2>&1 || true
   installer="$(mktemp /tmp/xray-install.XXXXXX)"
   if ! curl --fail --location --silent --show-error \
@@ -85,36 +134,41 @@ install_xray_core() {
       --output "$installer" \
       https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh; then
     rm -f -- "$installer"
-    die "не удалось скачать официальный установщик Xray Core"
+    die "$(l10n 'не удалось скачать официальный установщик Xray Core' 'failed to download the official Xray Core installer')"
   fi
   chmod 0700 "$installer"
-  if ! bash "$installer" install; then
+  for attempt in 1 2 3; do
+    if bash "$installer" install; then installed=1; break; fi
+    err "$(l10n 'Попытка установки Xray %s/3 не удалась' 'Xray installation attempt %s/3 failed' "$attempt")"
+    (( attempt < 3 )) && sleep $((attempt * 3))
+  done
+  if (( ! installed )); then
     rm -f -- "$installer"
-    die "официальный установщик Xray Core завершился с ошибкой"
+    die "$(l10n 'официальный установщик Xray Core завершился с ошибкой после трёх попыток' 'the official Xray Core installer failed after three attempts')"
   fi
   rm -f -- "$installer"
   # Официальный установщик создаёт собственный сервис. Им управлять не нужно:
   # профили запускаются изолированным xray-tui.service.
   systemctl disable --now xray.service >/dev/null 2>&1 || true
   hash -r
-  is_xray_core || die "Xray Core установился, но команда xray не найдена"
-  say "Готово: $(xray version 2>/dev/null | head -n 1)"
+  is_xray_core || die "$(l10n 'Xray Core установился, но команда xray не найдена' 'Xray Core was installed, but the xray command was not found')"
+  say "$(l10n 'Готово: %s' 'Ready: %s' "$(xray version 2>/dev/null | head -n 1)")"
 }
 
 install_app() {
   need_root install "$@"
   local src xray_bin was_active=0
   src="$(readlink -f "$0")"
-  have apt-get || die "установка поддерживается только на Debian/Ubuntu"
-  say "Устанавливаю зависимости…"
+  have apt-get || die "$(l10n 'установка поддерживается только на Debian/Ubuntu' 'installation is supported only on Debian/Ubuntu')"
+  say "$(l10n 'Устанавливаю зависимости…' 'Installing dependencies…')"
   apt-get update
   DEBIAN_FRONTEND=noninteractive apt-get install -y \
     python3 dialog curl iproute2 ca-certificates unzip openssl kmod
   systemctl is-active --quiet "$SERVICE" 2>/dev/null && was_active=1
   install_xray_core
   xray_bin="$(command -v xray)"
-  install -d -m 0755 /usr/local/bin "$ETC_DIR" "$PROFILE_DIR"
-  [[ -f "$MODE_FILE" ]] || printf 'proxy\n' > "$MODE_FILE"
+  install -d -m 0755 /usr/local/bin "$ETC_DIR" "$PROFILE_DIR" "$SUB_DIR"
+  [[ -f "$MODE_FILE" ]] || printf '%s\n' "$DEFAULT_MODE" > "$MODE_FILE"
   if [[ "$src" != "/usr/local/bin/xray-tui" ]]; then
     install -m 0755 "$src" /usr/local/bin/xray-tui
   fi
@@ -150,26 +204,105 @@ EOF
   systemctl daemon-reload
   systemctl reset-failed "$SERVICE" 2>/dev/null || true
   if (( was_active )) && [[ -f "$ACTIVE_LINK" ]]; then
-    systemctl start "$SERVICE"
+    systemctl restart "$SERVICE"
   fi
-  say "Готово. Запуск: sudo xray-tui"
+  say "$(l10n 'Готово. Запуск: sudo xray-tui' 'Installation complete. Run: sudo xray-tui')"
+}
+
+UPDATE_FILE=""
+UPDATE_VERSION=""
+
+cleanup_update() {
+  [[ -n "$UPDATE_FILE" ]] && rm -f -- "$UPDATE_FILE"
+  UPDATE_FILE=""; UPDATE_VERSION=""
+}
+
+version_is_newer() {
+  local candidate="$1" newest
+  [[ "$candidate" != "$VERSION" ]] || return 1
+  newest="$(printf '%s\n%s\n' "$VERSION" "$candidate" | sort -V | tail -n 1)"
+  [[ "$newest" == "$candidate" ]]
+}
+
+download_update() {
+  local first_line
+  have curl || { err "$(l10n 'не найден curl' 'curl was not found')"; return 1; }
+  UPDATE_FILE="$(mktemp --suffix=.sh /tmp/xray-tui-update.XXXXXX)"
+  if ! curl --fail --location --silent --show-error --compressed --retry 3 \
+      --connect-timeout 10 --max-time 60 --proto '=https' --tlsv1.2 \
+      --user-agent "xray-tui/$VERSION" --output "$UPDATE_FILE" "$UPDATE_URL"; then
+    err "$(l10n 'не удалось скачать обновление с GitHub' 'failed to download the update from GitHub')"
+    cleanup_update; return 1
+  fi
+  first_line="$(head -n 1 "$UPDATE_FILE")"
+  if [[ "$first_line" != '#!/usr/bin/env bash' ]] || ! grep -Fqx 'APP="xray-tui"' "$UPDATE_FILE"; then
+    err "$(l10n 'загруженный файл не является xray-tui' 'the downloaded file is not xray-tui')"
+    cleanup_update; return 1
+  fi
+  UPDATE_VERSION="$(sed -n 's/^VERSION="\([0-9][0-9.]*\)"$/\1/p' "$UPDATE_FILE" | head -n 1)"
+  if [[ ! "$UPDATE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || ! bash -n "$UPDATE_FILE"; then
+    err "$(l10n 'обновление не прошло проверку формата и Bash-синтаксиса' 'the update failed format and Bash syntax validation')"
+    cleanup_update; return 1
+  fi
+  chmod 0700 "$UPDATE_FILE"
+}
+
+install_downloaded_update() {
+  local new_version="$UPDATE_VERSION" downloaded="$UPDATE_FILE"
+  [[ -n "$downloaded" && -f "$downloaded" ]] || return 1
+  if ! bash "$downloaded" install; then
+    cleanup_update
+    err "$(l10n 'установка обновления завершилась с ошибкой' 'update installation failed')"
+    return 1
+  fi
+  cleanup_update
+  hash -r
+  say "$(l10n 'xray-tui обновлён до версии %s' 'xray-tui was updated to version %s' "$new_version")"
+}
+
+update_cmd() {
+  need_runtime
+  local action="${1:-}" answer
+  say "$(l10n 'Проверяю обновления…' 'Checking for updates…')"
+  download_update || return 1
+  if ! version_is_newer "$UPDATE_VERSION"; then
+    if [[ "$UPDATE_VERSION" == "$VERSION" ]]; then
+      say "$(l10n 'Установлена актуальная версия: %s' 'The latest version is already installed: %s' "$VERSION")"
+    else
+      say "$(l10n 'Удалённая версия %s не новее установленной %s' 'Remote version %s is not newer than installed version %s' "$UPDATE_VERSION" "$VERSION")"
+    fi
+    cleanup_update; return 0
+  fi
+  say "$(l10n 'Доступно обновление: %s → %s' 'Update available: %s → %s' "$VERSION" "$UPDATE_VERSION")"
+  [[ "$action" != "--check" ]] || { cleanup_update; return 0; }
+  if [[ "$action" != "--yes" ]]; then
+    if [[ ! -t 0 ]]; then
+      say "$(l10n 'Для установки выполните: xray-tui update --yes' 'To install it, run: xray-tui update --yes')"
+      cleanup_update; return 0
+    fi
+    read -r -p "$(l10n 'Установить обновление? [y/N] ' 'Install the update? [y/N] ')" answer
+    [[ "$answer" =~ ^[YyДд]$ ]] || { cleanup_update; return 0; }
+  fi
+  install_downloaded_update
 }
 
 parse_uri() {
   local uri="$1" fallback="$2"
-  FALLBACK_NAME="$fallback" SOCKS_PORT="$SOCKS_PORT" HTTP_PORT="$HTTP_PORT" python3 3<<<"$uri" <<'PY'
+  FALLBACK_NAME="$fallback" SOCKS_PORT="$SOCKS_PORT" HTTP_PORT="$HTTP_PORT" XRAY_TUI_LANGUAGE="$UI_LANG" python3 3<<<"$uri" <<'PY'
 import base64, json, os, sys
 from urllib.parse import urlsplit, parse_qs, unquote
 
 uri=os.fdopen(3).read().strip()
 fallback=os.environ.get('FALLBACK_NAME','').strip()
 socks=int(os.environ['SOCKS_PORT']); http=int(os.environ['HTTP_PORT'])
+lang=os.environ.get('XRAY_TUI_LANGUAGE','en')
 
+def tr(ru,en): return ru if lang=='ru' else en
 def fail(msg): print('xray-tui: '+msg, file=sys.stderr); raise SystemExit(2)
 def b64(s):
     s=s.strip().replace('-','+').replace('_','/')
     try: return base64.b64decode(s+'='*((4-len(s)%4)%4)).decode()
-    except Exception: fail('некорректный base64 в ссылке')
+    except Exception: fail(tr('некорректный base64 в ссылке','invalid base64 data in URI'))
 def one(q,k,default=''): return q.get(k,[default])[0]
 def stream(q):
     net=one(q,'type','tcp'); sec=one(q,'security','none')
@@ -202,9 +335,9 @@ if uri.startswith('vmess://'):
     outbound={'protocol':'vmess','settings':{'vnext':[{'address':host,'port':port,'users':[user]}]},'streamSettings':stream(q),'tag':'proxy'}
 else:
     try: u=urlsplit(uri)
-    except Exception: fail('не удалось разобрать URI')
+    except Exception: fail(tr('не удалось разобрать URI','failed to parse URI'))
     proto=u.scheme.lower(); q=parse_qs(u.query,keep_blank_values=True)
-    if proto not in ('vless','trojan','ss'): fail('поддерживаются vless://, vmess://, trojan:// и ss://')
+    if proto not in ('vless','trojan','ss'): fail(tr('поддерживаются vless://, vmess://, trojan:// и ss://','supported schemes: vless://, vmess://, trojan://, and ss://'))
     name=fallback or unquote(u.fragment) or (u.hostname or 'profile')
     if proto=='ss':
         # SIP002: ss://base64(method:password)@host:port or whole authority in base64
@@ -216,11 +349,11 @@ else:
             else:
                 decoded=b64(uri[5:].split('#',1)[0].split('?',1)[0]); auth,addr=decoded.rsplit('@',1)
                 method,password=auth.split(':',1); host,port=addr.rsplit(':',1); port=int(port.strip('[]'))
-        except Exception: fail('некорректная Shadowsocks-ссылка')
+        except Exception: fail(tr('некорректная Shadowsocks-ссылка','invalid Shadowsocks URI'))
         outbound={'protocol':'shadowsocks','settings':{'servers':[{'address':host,'port':port,'method':method,'password':password}]},'tag':'proxy'}
     else:
         host=u.hostname or ''; port=u.port or 0; secret=unquote(u.username or '')
-        if not host or not port or not secret: fail('в ссылке отсутствует сервер, порт или ключ')
+        if not host or not port or not secret: fail(tr('в ссылке отсутствует сервер, порт или ключ','server, port, or credential is missing from URI'))
         if proto=='vless':
             user={'id':secret,'encryption':one(q,'encryption','none')}
             if one(q,'flow'): user['flow']=one(q,'flow')
@@ -229,7 +362,7 @@ else:
         else: settings={'servers':[{'address':host,'port':port,'password':secret}]}
         outbound={'protocol':proto,'settings':settings,'streamSettings':stream(q),'tag':'proxy'}
 
-if not host or not port: fail('в ссылке отсутствует сервер или порт')
+if not host or not port: fail(tr('в ссылке отсутствует сервер или порт','server or port is missing from URI'))
 cfg={
  'log':{'loglevel':'warning'},
  'dns':{'servers':['https+local://1.1.1.1/dns-query','localhost']},
@@ -244,30 +377,225 @@ print(json.dumps({'name':name,'config':cfg},ensure_ascii=False))
 PY
 }
 
+validate_profile_config() {
+  local source="$1" validation output
+  validation="$(mktemp --suffix=.json "$PROFILE_DIR/.validate.XXXXXX")"
+  chmod 0600 "$validation"
+  python3 - "$source" "$validation" <<'PY'
+import json,sys
+with open(sys.argv[1],encoding='utf-8') as src:
+    cfg=json.load(src)
+# Проверяем outbound/transport без попытки занять порты уже работающего профиля.
+cfg['inbounds']=[]
+with open(sys.argv[2],'w',encoding='utf-8') as dst:
+    json.dump(cfg,dst,ensure_ascii=False)
+PY
+  if ! output="$(xray run -test -c "$validation" 2>&1)"; then
+    rm -f -- "$validation"
+    printf '%s\n' "$output" >&2
+    return 1
+  fi
+  rm -f -- "$validation"
+}
+
 import_profile() {
   need_runtime
   local uri="${1:-}" requested="${2:-}" parsed name cfg tmp target
   if [[ -z "$uri" ]]; then
-    if [[ -t 0 ]]; then read -r -p "Вставьте URI подключения: " uri; else IFS= read -r uri; fi
+    if [[ -t 0 ]]; then read -r -p "$(l10n 'Вставьте URI подключения: ' 'Paste connection URI: ')" uri; else IFS= read -r uri; fi
   fi
-  [[ -n "$uri" ]] || die "пустая ссылка"
+  [[ -n "$uri" ]] || die "$(l10n 'пустая ссылка' 'empty URI')"
   parsed="$(parse_uri "$uri" "$requested")" || exit $?
   name="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])' <<<"$parsed")"
   name="$(safe_name "$name")"
   cfg="$(python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["config"],ensure_ascii=False,indent=2))' <<<"$parsed")"
   target="$(profile_path "$name")"
   if [[ -e "$target" ]]; then
-    if [[ -t 0 ]]; then read -r -p "Профиль '$name' уже существует. Заменить? [y/N] " requested; [[ "$requested" =~ ^[YyДд]$ ]] || return 1
-    else die "профиль '$name' уже существует"; fi
+    if [[ -t 0 ]]; then read -r -p "$(l10n "Профиль '$name' уже существует. Заменить? [y/N] " "Profile '$name' already exists. Replace it? [y/N] ")" requested; [[ "$requested" =~ ^[YyДд]$ ]] || return 1
+    else die "$(l10n "профиль '$name' уже существует" "profile '$name' already exists")"; fi
   fi
   # Современные версии Xray выбирают парсер конфигурации по расширению файла.
   tmp="$(mktemp --suffix=.json "$PROFILE_DIR/.import.XXXXXX")"
   chmod 0600 "$tmp"
   printf '%s\n' "$cfg" > "$tmp"
-  if ! xray run -test -c "$tmp"; then rm -f -- "$tmp"; die "Xray отклонил конфигурацию"; fi
+  if ! validate_profile_config "$tmp"; then rm -f -- "$tmp"; die "$(l10n 'Xray отклонил конфигурацию' 'Xray rejected the configuration')"; fi
   mv -f -- "$tmp" "$target"
   chmod 0600 "$target"
-  say "Импортирован профиль: $name"
+  say "$(l10n 'Импортирован профиль: %s' 'Imported profile: %s' "$name")"
+}
+
+extract_subscription_uris() {
+  local source="$1"
+  python3 - "$source" <<'PY'
+import base64, re, sys
+
+raw=open(sys.argv[1],'rb').read().strip()
+
+def text(data):
+    return data.decode('utf-8-sig', errors='replace')
+
+def links(value):
+    result=[]
+    for line in value.replace('\r','\n').split('\n'):
+        line=line.strip()
+        if re.match(r'^(vless|vmess|trojan|ss)://', line, re.I):
+            result.append(line)
+    return result
+
+found=links(text(raw))
+if not found:
+    compact=re.sub(rb'\s+',b'',raw).replace(b'-',b'+').replace(b'_',b'/')
+    try:
+        decoded=base64.b64decode(compact+b'='*((4-len(compact)%4)%4), validate=False)
+        found=links(text(decoded))
+    except Exception:
+        pass
+
+for uri in found:
+    print(uri)
+PY
+}
+
+subscription_refresh_one() {
+  need_runtime
+  local sub raw_name url="${2:-}" url_file map_file download links stage map_tmp url_tmp
+  local uri parsed node base profile_name target active="" old f
+  local count=0 skipped=0 suffix
+  [[ $# -ge 1 && -n "$1" ]] || die "$(l10n 'укажите имя подписки' 'specify a subscription name')"
+  raw_name="$1"
+  sub="$(safe_name "$raw_name")"
+  url_file="$SUB_DIR/$sub.url"; map_file="$SUB_DIR/$sub.profiles"
+  if [[ -z "$url" && -f "$url_file" ]]; then url="$(<"$url_file")"; fi
+  [[ "$url" =~ ^https?:// ]] || die "$(l10n 'URL подписки должен начинаться с http:// или https://' 'subscription URL must start with http:// or https://')"
+
+  download="$(mktemp --suffix=.data "$SUB_DIR/.download.XXXXXX")"
+  links="$(mktemp "$SUB_DIR/.links.XXXXXX")"
+  stage="$(mktemp -d "$SUB_DIR/.stage.XXXXXX")"
+  map_tmp="$(mktemp "$SUB_DIR/.profiles.XXXXXX")"
+  url_tmp="$(mktemp "$SUB_DIR/.url.XXXXXX")"
+
+  say "$(l10n "Загружаю подписку '%s'…" "Downloading subscription '%s'…" "$sub")"
+  if ! curl --fail --location --silent --show-error --compressed --retry 2 \
+      --connect-timeout 10 --max-time 45 --user-agent "xray-tui/$VERSION" \
+      --output "$download" "$url"; then
+    rm -f -- "$download" "$links" "$map_tmp" "$url_tmp"
+    case "$stage" in "$SUB_DIR"/.stage.*) rm -rf -- "$stage" ;; esac
+    die "$(l10n "не удалось загрузить подписку '%s'" "failed to download subscription '%s'" "$sub")"
+  fi
+  extract_subscription_uris "$download" > "$links"
+  [[ -s "$links" ]] || {
+    rm -f -- "$download" "$links" "$map_tmp" "$url_tmp"
+    case "$stage" in "$SUB_DIR"/.stage.*) rm -rf -- "$stage" ;; esac
+    die "$(l10n 'в подписке не найдены поддерживаемые URI (нужен обычный или Base64-список)' 'no supported URIs found in subscription (expected a plain-text or Base64 list)')"
+  }
+
+  while IFS= read -r uri; do
+    if ! parsed="$(parse_uri "$uri" "" 2>/dev/null)"; then ((skipped+=1)); continue; fi
+    node="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])' <<<"$parsed")"
+    base="$(safe_name "${sub}__${node}")"; base="${base:0:56}"
+    profile_name="$base"; suffix=2
+    while [[ -e "$stage/$profile_name.json" ]]; do
+      profile_name="${base}_${suffix}"; ((suffix+=1))
+    done
+    target="$stage/$profile_name.json"
+    PARSED="$parsed" python3 - "$target" <<'PY'
+import json,os,sys
+with open(sys.argv[1],'w',encoding='utf-8') as f:
+    json.dump(json.loads(os.environ['PARSED'])['config'],f,ensure_ascii=False,indent=2)
+    f.write('\n')
+PY
+    if ! validate_profile_config "$target" >/dev/null 2>&1; then
+      rm -f -- "$target"; ((skipped+=1)); continue
+    fi
+    printf '%s\n' "$profile_name" >> "$map_tmp"; ((count+=1))
+  done < "$links"
+
+  if (( count == 0 )); then
+    rm -f -- "$download" "$links" "$map_tmp" "$url_tmp"
+    case "$stage" in "$SUB_DIR"/.stage.*) rm -rf -- "$stage" ;; esac
+    die "$(l10n 'ни один сервер подписки не прошёл проверку Xray' 'none of the subscription servers passed Xray validation')"
+  fi
+
+  [[ -f "$ACTIVE_NAME" ]] && active="$(<"$ACTIVE_NAME")"
+  if [[ -f "$map_file" ]]; then
+    while IFS= read -r old; do
+      [[ -n "$old" ]] || continue
+      if ! grep -Fqx -- "$old" "$map_tmp"; then
+        if [[ "$old" == "$active" ]]; then
+          printf '%s\n' "$old" >> "$map_tmp"
+          err "$(l10n "активный удалённый сервер '%s' оставлен до переключения профиля" "removed active server '%s' was retained until the profile is switched" "$old")"
+        else
+          rm -f -- "$(profile_path "$old")"
+        fi
+      fi
+    done < "$map_file"
+  fi
+  for f in "$stage"/*.json; do install -m 0600 "$f" "$PROFILE_DIR/$(basename "$f")"; done
+  printf '%s\n' "$url" > "$url_tmp"; chmod 0600 "$url_tmp" "$map_tmp"
+  mv -f -- "$url_tmp" "$url_file"; mv -f -- "$map_tmp" "$map_file"
+  rm -f -- "$download" "$links"
+  case "$stage" in "$SUB_DIR"/.stage.*) rm -rf -- "$stage" ;; esac
+  say "$(l10n "Подписка '%s' обновлена: серверов %s, пропущено %s" "Subscription '%s' updated: %s servers, %s skipped" "$sub" "$count" "$skipped")"
+}
+
+subscription_add() {
+  local name="${1:-}" url="${2:-}"
+  if [[ -z "$name" && -t 0 ]]; then read -r -p "$(l10n 'Имя подписки: ' 'Subscription name: ')" name; fi
+  if [[ -z "$url" && -t 0 ]]; then read -r -p "$(l10n 'URL подписки: ' 'Subscription URL: ')" url; fi
+  [[ -n "$name" && -n "$url" ]] || die "$(l10n 'использование: xray-tui subscription add NAME URL' 'usage: xray-tui subscription add NAME URL')"
+  subscription_refresh_one "$name" "$url"
+}
+
+subscription_list() {
+  need_runtime
+  local f name count
+  shopt -s nullglob
+  for f in "$SUB_DIR"/*.url; do
+    name="$(basename "$f" .url)"; count=0
+    [[ -f "$SUB_DIR/$name.profiles" ]] && count="$(grep -cve '^$' "$SUB_DIR/$name.profiles" || true)"
+    l10n '%s (%s серверов)\n' '%s (%s servers)\n' "$name" "$count"
+  done
+}
+
+subscription_refresh() {
+  need_runtime
+  local name="${1:-}" f found=0
+  if [[ -n "$name" ]]; then subscription_refresh_one "$name"; return; fi
+  shopt -s nullglob
+  for f in "$SUB_DIR"/*.url; do found=1; subscription_refresh_one "$(basename "$f" .url)"; done
+  (( found )) || die "$(l10n 'подписки не добавлены' 'no subscriptions have been added')"
+}
+
+subscription_delete() {
+  need_runtime
+  local sub map_file active="" profile kept=0
+  [[ $# -ge 1 && -n "$1" ]] || die "$(l10n 'укажите имя подписки' 'specify a subscription name')"
+  sub="$(safe_name "$1")"; map_file="$SUB_DIR/$sub.profiles"
+  [[ -f "$SUB_DIR/$sub.url" ]] || die "$(l10n "подписка '%s' не найдена" "subscription '%s' was not found" "$sub")"
+  [[ -f "$ACTIVE_NAME" ]] && active="$(<"$ACTIVE_NAME")"
+  if [[ -f "$map_file" ]]; then
+    while IFS= read -r profile; do
+      [[ -n "$profile" ]] || continue
+      if [[ "$profile" == "$active" ]]; then kept=1; else rm -f -- "$(profile_path "$profile")"; fi
+    done < "$map_file"
+  fi
+  rm -f -- "$SUB_DIR/$sub.url" "$map_file"
+  if (( kept )); then
+    say "$(l10n "Подписка '%s' удалена; активный профиль сохранён" "Subscription '%s' deleted; the active profile was retained" "$sub")"
+  else
+    say "$(l10n "Подписка '%s' удалена" "Subscription '%s' deleted" "$sub")"
+  fi
+}
+
+subscription_cmd() {
+  local action="${1:-list}"; [[ $# -gt 0 ]] && shift
+  case "$action" in
+    add) subscription_add "$@" ;;
+    refresh|update) subscription_refresh "$@" ;;
+    list) subscription_list ;;
+    delete|rm) subscription_delete "$@" ;;
+    *) die "$(l10n 'использование: xray-tui subscription add|refresh|list|delete' 'usage: xray-tui subscription add|refresh|list|delete')" ;;
+  esac
 }
 
 list_profiles() {
@@ -283,9 +611,9 @@ list_profiles() {
 }
 
 current_mode() {
-  local mode="proxy"
+  local mode="$DEFAULT_MODE"
   [[ -f "$MODE_FILE" ]] && mode="$(<"$MODE_FILE")"
-  [[ "$mode" == "tun" ]] || mode="proxy"
+  [[ "$mode" == "proxy" || "$mode" == "tun" ]] || mode="$DEFAULT_MODE"
   printf '%s' "$mode"
 }
 
@@ -327,12 +655,12 @@ build_active_config() {
   chmod 0600 "$tmp"
   if ! render_active_config "$profile" "$mode" > "$tmp"; then
     rm -f -- "$tmp"
-    err "не удалось собрать активную конфигурацию"
+    err "$(l10n 'не удалось собрать активную конфигурацию' 'failed to build the active configuration')"
     return 1
   fi
   if ! xray run -test -c "$tmp"; then
     rm -f -- "$tmp"
-    err "Xray отклонил конфигурацию режима '$mode'"
+    err "$(l10n "Xray отклонил конфигурацию режима '%s'" "Xray rejected the '%s' mode configuration" "$mode")"
     return 1
   fi
   mv -f -- "$tmp" "$ACTIVE_LINK"
@@ -341,7 +669,7 @@ build_active_config() {
 
 ensure_tun_available() {
   [[ -c /dev/net/tun ]] || modprobe tun 2>/dev/null || true
-  [[ -c /dev/net/tun ]] || die "устройство /dev/net/tun недоступно (проверьте поддержку TUN ядром или настройку VPS/контейнера)"
+  [[ -c /dev/net/tun ]] || die "$(l10n 'устройство /dev/net/tun недоступно (проверьте поддержку TUN ядром или настройку VPS/контейнера)' '/dev/net/tun is unavailable (check kernel TUN support or VPS/container settings)')"
 }
 
 tun_down() {
@@ -378,11 +706,11 @@ tun_up() {
     ip link show dev "$TUN_NAME" >/dev/null 2>&1 && break
     sleep 0.1
   done
-  ip link show dev "$TUN_NAME" >/dev/null 2>&1 || die "интерфейс $TUN_NAME не появился"
+  ip link show dev "$TUN_NAME" >/dev/null 2>&1 || die "$(l10n 'интерфейс %s не появился' 'interface %s did not appear' "$TUN_NAME")"
 
   default4="$(ip -4 route show default | head -n 1)"
   iface="$(awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}' <<<"$default4")"
-  [[ -n "$iface" && "$iface" != "$TUN_NAME" ]] || die "не удалось определить физический сетевой интерфейс"
+  [[ -n "$iface" && "$iface" != "$TUN_NAME" ]] || die "$(l10n 'не удалось определить физический сетевой интерфейс' 'failed to detect the physical network interface')"
 
   mapfile -t servers4 < <(
     while IFS= read -r host; do getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}'; done < <(python3 - "$ACTIVE_LINK" <<'PY'
@@ -408,7 +736,7 @@ for out in d.get('outbounds',[]):
 PY
     ) | sort -u
   )
-  ((${#servers4[@]} + ${#servers6[@]} > 0)) || die "не удалось определить IP VPN-сервера до изменения маршрутов"
+  ((${#servers4[@]} + ${#servers6[@]} > 0)) || die "$(l10n 'не удалось определить IP VPN-сервера до изменения маршрутов' 'failed to resolve the VPN server before changing routes')"
 
   umask 077
   : > "$TUN_STATE"
@@ -459,7 +787,7 @@ PY
 set_mode() {
   need_runtime
   local mode="${1:-}" active="" was_active=0 path
-  [[ "$mode" == "proxy" || "$mode" == "tun" ]] || die "использование: xray-tui mode proxy|tun"
+  [[ "$mode" == "proxy" || "$mode" == "tun" ]] || die "$(l10n 'использование: xray-tui mode proxy|tun' 'usage: xray-tui mode proxy|tun')"
   [[ "$mode" != "tun" ]] || ensure_tun_available
   systemctl is-active --quiet "$SERVICE" && was_active=1
   (( was_active )) && systemctl stop "$SERVICE"
@@ -467,7 +795,7 @@ set_mode() {
     active="$(<"$ACTIVE_NAME")"; path="$(profile_path "$active")"
     if [[ -f "$path" ]] && ! build_active_config "$path" "$mode"; then
       (( was_active )) && systemctl start "$SERVICE" || true
-      die "не удалось переключить режим; прежнее подключение восстановлено"
+      die "$(l10n 'не удалось переключить режим; прежнее подключение восстановлено' 'failed to switch mode; the previous connection was restored')"
     fi
   fi
   printf '%s\n' "$mode" > "$MODE_FILE"
@@ -476,48 +804,50 @@ set_mode() {
     sleep 1
     if ! systemctl is-active --quiet "$SERVICE"; then
       journalctl -u "$SERVICE" -n 20 --no-pager >&2
-      die "Xray не запустился в режиме '$mode'"
+      die "$(l10n "Xray не запустился в режиме '%s'" "Xray failed to start in '%s' mode" "$mode")"
     fi
   fi
   if [[ "$mode" == "tun" ]]; then
-    say "Режим TUN включён: весь системный IPv4/IPv6-трафик пойдёт через Xray"
+    say "$(l10n 'Режим TUN включён: весь системный IPv4/IPv6-трафик пойдёт через Xray' 'TUN mode enabled: all system IPv4/IPv6 traffic will go through Xray')"
   else
-    say "Режим Proxy включён: SOCKS5 127.0.0.1:$SOCKS_PORT, HTTP 127.0.0.1:$HTTP_PORT"
+    say "$(l10n 'Режим Proxy включён: SOCKS5 127.0.0.1:%s, HTTP 127.0.0.1:%s' 'Proxy mode enabled: SOCKS5 127.0.0.1:%s, HTTP 127.0.0.1:%s' "$SOCKS_PORT" "$HTTP_PORT")"
   fi
 }
 
 up_profile() {
   need_runtime
   local name path mode was_active=0
-  name="$(safe_name "${1:?укажите профиль}")"; path="$(profile_path "$name")"
-  [[ -f "$path" ]] || die "профиль '$name' не найден"
+  [[ $# -ge 1 && -n "$1" ]] || die "$(l10n 'укажите профиль' 'specify a profile')"
+  name="$(safe_name "$1")"; path="$(profile_path "$name")"
+  [[ -f "$path" ]] || die "$(l10n "профиль '%s' не найден" "profile '%s' was not found" "$name")"
   mode="$(current_mode)"
   [[ "$mode" != "tun" ]] || ensure_tun_available
   systemctl is-active --quiet "$SERVICE" && was_active=1
   (( was_active )) && systemctl stop "$SERVICE"
   if ! build_active_config "$path" "$mode"; then
     (( was_active )) && systemctl start "$SERVICE" || true
-    die "не удалось переключить профиль; прежнее подключение восстановлено"
+    die "$(l10n 'не удалось переключить профиль; прежнее подключение восстановлено' 'failed to switch profile; the previous connection was restored')"
   fi
   printf '%s\n' "$name" > "$ACTIVE_NAME"
   systemctl start "$SERVICE"
   sleep 1
-  if systemctl is-active --quiet "$SERVICE"; then say "Подключено: $name (режим: $mode)"; else
+  if systemctl is-active --quiet "$SERVICE"; then say "$(l10n 'Подключено: %s (режим: %s)' 'Connected: %s (mode: %s)' "$name" "$mode")"; else
     journalctl -u "$SERVICE" -n 15 --no-pager >&2
-    die "Xray не запустился"
+    die "$(l10n 'Xray не запустился' 'Xray failed to start')"
   fi
 }
 
-down_profile() { need_runtime; systemctl stop "$SERVICE"; say "Отключено"; }
+down_profile() { need_runtime; systemctl stop "$SERVICE"; say "$(l10n 'Отключено' 'Disconnected')"; }
 
 status_cmd() {
   need_runtime
-  local active="нет" enabled="нет" state="отключено" mode
+  local active enabled state mode
+  active="$(l10n 'нет' 'none')"; enabled="$(l10n 'нет' 'no')"; state="$(l10n 'отключено' 'disconnected')"
   mode="$(current_mode)"
   [[ -f "$ACTIVE_NAME" ]] && active="$(<"$ACTIVE_NAME")"
-  systemctl is-active --quiet "$SERVICE" && state="подключено"
-  systemctl is-enabled --quiet "$SERVICE" 2>/dev/null && enabled="да"
-  printf 'Состояние: %s\nПрофиль:   %s\nРежим:     %s\nАвтозапуск: %s\nSOCKS5:    127.0.0.1:%s\nHTTP:      127.0.0.1:%s\n' "$state" "$active" "$mode" "$enabled" "$SOCKS_PORT" "$HTTP_PORT"
+  systemctl is-active --quiet "$SERVICE" && state="$(l10n 'подключено' 'connected')"
+  systemctl is-enabled --quiet "$SERVICE" 2>/dev/null && enabled="$(l10n 'да' 'yes')"
+  l10n 'Состояние: %s\nПрофиль:   %s\nРежим:     %s\nАвтозапуск: %s\nSOCKS5:    127.0.0.1:%s\nHTTP:      127.0.0.1:%s\n' 'State:      %s\nProfile:    %s\nMode:       %s\nAutostart:  %s\nSOCKS5:     127.0.0.1:%s\nHTTP:       127.0.0.1:%s\n' "$state" "$active" "$mode" "$enabled" "$SOCKS_PORT" "$HTTP_PORT"
   systemctl show "$SERVICE" -p MainPID -p ActiveEnterTimestamp 2>/dev/null | sed '/MainPID=0/d;/=$/d' || true
   if have ss; then ss -lntup 2>/dev/null | awk -v s=":$SOCKS_PORT" -v h=":$HTTP_PORT" 'index($0,s)||index($0,h)' || true; fi
   if [[ "$mode" == "tun" ]] && have ip; then
@@ -530,21 +860,22 @@ probe_cmd() {
   need_runtime
   local mode
   mode="$(current_mode)"
-  systemctl is-active --quiet "$SERVICE" || die "подключение не активно"
-  have curl || die "не найден curl"
+  systemctl is-active --quiet "$SERVICE" || die "$(l10n 'подключение не активно' 'connection is not active')"
+  have curl || die "$(l10n 'не найден curl' 'curl was not found')"
   if [[ "$mode" == "tun" ]]; then
-    say "Проверяю системный трафик через TUN…"
+    say "$(l10n 'Проверяю системный трафик через TUN…' 'Checking system traffic through TUN…')"
     curl --fail --silent --show-error --max-time 12 --noproxy '*' https://www.cloudflare.com/cdn-cgi/trace
   else
-    say "Проверяю доступ через SOCKS5…"
+    say "$(l10n 'Проверяю доступ через SOCKS5…' 'Checking connectivity through SOCKS5…')"
     curl --fail --silent --show-error --max-time 12 --proxy "socks5h://127.0.0.1:$SOCKS_PORT" https://www.cloudflare.com/cdn-cgi/trace
   fi | awk -F= '$1=="ip"||$1=="loc"||$1=="warp"{print}'
 }
 
 show_profile() {
   need_runtime
-  local path; path="$(profile_path "${1:?укажите профиль}")"
-  [[ -f "$path" ]] || die "профиль не найден"
+  [[ $# -ge 1 && -n "$1" ]] || die "$(l10n 'укажите профиль' 'specify a profile')"
+  local path; path="$(profile_path "$1")"
+  [[ -f "$path" ]] || die "$(l10n 'профиль не найден' 'profile was not found')"
   python3 - "$path" <<'PY'
 import json,sys
 d=json.load(open(sys.argv[1]))
@@ -564,79 +895,180 @@ PY
 delete_profile() {
   need_runtime
   local name path active=""
-  name="$(safe_name "${1:?укажите профиль}")"; path="$(profile_path "$name")"
-  [[ -f "$path" ]] || die "профиль не найден"
+  [[ $# -ge 1 && -n "$1" ]] || die "$(l10n 'укажите профиль' 'specify a profile')"
+  name="$(safe_name "$1")"; path="$(profile_path "$name")"
+  [[ -f "$path" ]] || die "$(l10n 'профиль не найден' 'profile was not found')"
   [[ -f "$ACTIVE_NAME" ]] && active="$(<"$ACTIVE_NAME")"
   if [[ "$name" == "$active" ]]; then
-    systemctl is-active --quiet "$SERVICE" && die "сначала отключите или переключите активный профиль"
+    systemctl is-active --quiet "$SERVICE" && die "$(l10n 'сначала отключите или переключите активный профиль' 'disconnect or switch the active profile first')"
     rm -f -- "$ACTIVE_LINK" "$ACTIVE_NAME"
   fi
   rm -f -- "$path"
-  say "Удалён профиль: $name"
+  say "$(l10n 'Удалён профиль: %s' 'Deleted profile: %s' "$name")"
 }
 
 autostart_cmd() {
   need_runtime
   case "${1:-}" in
-    on) [[ -f "$ACTIVE_LINK" ]] || die "сначала выберите профиль"; systemctl enable "$SERVICE"; say "Автозапуск включён" ;;
-    off) systemctl disable "$SERVICE"; say "Автозапуск выключен" ;;
-    *) die "использование: xray-tui autostart on|off" ;;
+    on) [[ -f "$ACTIVE_LINK" ]] || die "$(l10n 'сначала выберите профиль' 'select a profile first')"; systemctl enable "$SERVICE"; say "$(l10n 'Автозапуск включён' 'Autostart enabled')" ;;
+    off) systemctl disable "$SERVICE"; say "$(l10n 'Автозапуск выключен' 'Autostart disabled')" ;;
+    *) die "$(l10n 'использование: xray-tui autostart on|off' 'usage: xray-tui autostart on|off')" ;;
   esac
 }
 
 choose_profile() {
-  local title="$1" items=() f n active=""
+  local title="$1" items=() f n active="" description
   [[ -f "$ACTIVE_NAME" ]] && active="$(<"$ACTIVE_NAME")"
   shopt -s nullglob
-  for f in "$PROFILE_DIR"/*.json; do n="$(basename "$f" .json)"; items+=("$n" "$([[ "$n" == "$active" ]] && echo активный || echo профиль)"); done
+  for f in "$PROFILE_DIR"/*.json; do
+    n="$(basename "$f" .json)"
+    if [[ "$n" == "$active" ]]; then description="$(l10n 'активный' 'active')"
+    elif [[ "$n" == *"__"* ]]; then description="$(l10n 'подписка: %s' 'subscription: %s' "${n%%__*}")"
+    else description="$(l10n 'профиль' 'profile')"
+    fi
+    items+=("$n" "$description")
+  done
   ((${#items[@]})) || return 1
-  dialog --stdout --title "$title" --menu "Выберите профиль" 20 72 12 "${items[@]}"
+  dialog --stdout --title "$title" --menu "$(l10n 'Выберите профиль' 'Select a profile')" 20 72 12 "${items[@]}"
+}
+
+choose_subscription() {
+  local title="$1" items=() f name count
+  shopt -s nullglob
+  for f in "$SUB_DIR"/*.url; do
+    name="$(basename "$f" .url)"; count=0
+    [[ -f "$SUB_DIR/$name.profiles" ]] && count="$(grep -cve '^$' "$SUB_DIR/$name.profiles" || true)"
+    items+=("$name" "$(l10n '%s серверов' '%s servers' "$count")")
+  done
+  ((${#items[@]})) || return 1
+  dialog --stdout --title "$title" --menu "$(l10n 'Выберите подписку' 'Select a subscription')" 20 76 12 "${items[@]}"
+}
+
+subscription_tui() {
+  local action name url output
+  while true; do
+    action="$(dialog --stdout --title "$(l10n 'Подписки' 'Subscriptions')" --menu "$(l10n 'Серверы из подписок появляются в общем списке профилей' 'Subscription servers appear in the regular profile list')" 18 86 8 \
+      1 "$(l10n 'Добавить подписку' 'Add subscription')" \
+      2 "$(l10n 'Обновить выбранную подписку' 'Refresh selected subscription')" \
+      3 "$(l10n 'Обновить все подписки' 'Refresh all subscriptions')" \
+      4 "$(l10n 'Показать подписки' 'List subscriptions')" \
+      5 "$(l10n 'Удалить подписку' 'Delete subscription')" \
+      0 "$(l10n 'Назад' 'Back')")" || return
+    case "$action" in
+      1)
+        name="$(dialog --stdout --inputbox "$(l10n 'Название подписки' 'Subscription name')" 9 72)" || continue
+        url="$(dialog --stdout --inputbox "$(l10n 'URL подписки (будет виден полностью)' 'Subscription URL (shown in full)')" 10 100)" || continue
+        output="$(subscription_add "$name" "$url" 2>&1)" || true
+        dialog --msgbox "$output" 13 90
+        ;;
+      2)
+        name="$(choose_subscription "$(l10n 'Обновление подписки' 'Refresh subscription')")" || { dialog --msgbox "$(l10n 'Подписки не добавлены' 'No subscriptions have been added')" 8 60; continue; }
+        output="$(subscription_refresh "$name" 2>&1)" || true
+        dialog --msgbox "$output" 13 90
+        ;;
+      3)
+        output="$(subscription_refresh 2>&1)" || true
+        dialog --msgbox "$output" 16 90
+        ;;
+      4)
+        output="$(subscription_list 2>&1)"
+        [[ -n "$output" ]] || output="$(l10n 'Подписки не добавлены' 'No subscriptions have been added')"
+        dialog --msgbox "$output" 16 76
+        ;;
+      5)
+        name="$(choose_subscription "$(l10n 'Удаление подписки' 'Delete subscription')")" || { dialog --msgbox "$(l10n 'Подписки не добавлены' 'No subscriptions have been added')" 8 60; continue; }
+        if dialog --yesno "$(l10n "Удалить подписку '%s' и её серверы?" "Delete subscription '%s' and its servers?" "$name")" 9 72; then
+          output="$(subscription_delete "$name" 2>&1)" || true
+          dialog --msgbox "$output" 10 76
+        fi
+        ;;
+      0) return ;;
+    esac
+  done
+}
+
+update_tui() {
+  local log output
+  log="$(mktemp)"
+  dialog --infobox "$(l10n 'Проверяю обновления на GitHub…' 'Checking GitHub for updates…')" 7 70
+  if ! download_update > "$log" 2>&1; then
+    output="$(<"$log")"; rm -f -- "$log"
+    dialog --msgbox "$output" 12 86
+    return
+  fi
+  if ! version_is_newer "$UPDATE_VERSION"; then
+    if [[ "$UPDATE_VERSION" == "$VERSION" ]]; then
+      output="$(l10n 'Установлена актуальная версия: %s' 'The latest version is already installed: %s' "$VERSION")"
+    else
+      output="$(l10n 'Удалённая версия %s не новее установленной %s' 'Remote version %s is not newer than installed version %s' "$UPDATE_VERSION" "$VERSION")"
+    fi
+    cleanup_update; rm -f -- "$log"
+    dialog --msgbox "$output" 9 76
+    return
+  fi
+  if ! dialog --yesno "$(l10n 'Доступно обновление: %s → %s\n\nСкачать и установить?' 'Update available: %s → %s\n\nDownload and install it?' "$VERSION" "$UPDATE_VERSION")" 11 76; then
+    cleanup_update; rm -f -- "$log"
+    return
+  fi
+  : > "$log"
+  if install_downloaded_update > "$log" 2>&1; then
+    output="$(<"$log")"
+  else
+    output="$(<"$log")"
+    [[ -n "$output" ]] || output="$(l10n 'Не удалось установить обновление' 'Failed to install the update')"
+  fi
+  rm -f -- "$log"
+  dialog --msgbox "$output" 15 90
 }
 
 tui() {
   need_runtime
-  have dialog || die "не найден dialog; выполните: apt install dialog"
+  have dialog || die "$(l10n 'не найден dialog; выполните: apt install dialog' 'dialog was not found; run: apt install dialog')"
   local choice uri name output log_file mode
   while true; do
     mode="$(current_mode)"
-    choice="$(dialog --stdout --clear --title "Xray TUI $VERSION — режим: $mode" --menu "Управление подключением Xray" 22 82 12 \
-      1 "Подключить / переключить профиль" \
-      2 "Отключиться" \
-      3 "Выбрать режим: Proxy или системный TUN" \
-      4 "Импортировать URI" \
-      5 "Состояние" \
-      6 "Проверить внешний IP" \
-      7 "Журнал Xray" \
-      8 "Удалить профиль" \
-      9 "Включить автозапуск" \
-      10 "Выключить автозапуск" \
-      0 "Выход")" || break
+    choice="$(dialog --stdout --clear --title "$(l10n 'Xray TUI %s — режим: %s' 'Xray TUI %s — mode: %s' "$VERSION" "$mode")" --menu "$(l10n 'Управление подключением Xray' 'Xray connection management')" 24 82 13 \
+      1 "$(l10n 'Подключить / переключить профиль' 'Connect / switch profile')" \
+      2 "$(l10n 'Отключиться' 'Disconnect')" \
+      3 "$(l10n 'Выбрать режим: Proxy или системный TUN' 'Select mode: Proxy or system-wide TUN')" \
+      4 "$(l10n 'Импортировать URI' 'Import URI')" \
+      5 "$(l10n 'Управление подписками' 'Subscription management')" \
+      6 "$(l10n 'Состояние' 'Status')" \
+      7 "$(l10n 'Проверить внешний IP' 'Check external IP')" \
+      8 "$(l10n 'Журнал Xray' 'Xray journal')" \
+      9 "$(l10n 'Удалить профиль' 'Delete profile')" \
+      10 "$(l10n 'Включить автозапуск' 'Enable autostart')" \
+      11 "$(l10n 'Выключить автозапуск' 'Disable autostart')" \
+      12 "$(l10n 'Проверить обновления' 'Check for updates')" \
+      0 "$(l10n 'Выход' 'Exit')")" || break
     case "$choice" in
       1)
-        name="$(choose_profile "Подключение")" || continue
+        name="$(choose_profile "$(l10n 'Подключение' 'Connect')")" || continue
         output="$(up_profile "$name" 2>&1)" || true
         dialog --msgbox "$output" 12 76
         ;;
       2) output="$(down_profile 2>&1)"; dialog --msgbox "$output" 8 60 ;;
       3)
-        mode="$(dialog --stdout --title "Режим подключения" --menu "Proxy затрагивает только настроенные приложения. TUN направляет весь системный трафик." 14 90 4 \
-          proxy "SOCKS5/HTTP на localhost" \
-          tun "Полный системный IPv4/IPv6-туннель")" || continue
+        mode="$(dialog --stdout --title "$(l10n 'Режим подключения' 'Connection mode')" --menu "$(l10n 'Proxy затрагивает только настроенные приложения. TUN направляет весь системный трафик.' 'Proxy affects configured applications only. TUN routes all system traffic.')" 14 90 4 \
+          proxy "$(l10n 'SOCKS5/HTTP на localhost' 'SOCKS5/HTTP on localhost')" \
+          tun "$(l10n 'Полный системный IPv4/IPv6-туннель' 'Full system-wide IPv4/IPv6 tunnel')")" || continue
         output="$(set_mode "$mode" 2>&1)" || true
         dialog --msgbox "$output" 12 86
         ;;
-      4) uri="$(dialog --stdout --inputbox "Вставьте vless://, vmess://, trojan:// или ss:// ссылку" 11 100)" || continue; output="$(import_profile "$uri" 2>&1)" || true; dialog --msgbox "$output" 12 80 ;;
-      5) output="$(status_cmd 2>&1)"; dialog --msgbox "$output" 20 92 ;;
-      6) output="$(probe_cmd 2>&1)" || true; dialog --msgbox "$output" 12 70 ;;
-      7)
+      4) uri="$(dialog --stdout --inputbox "$(l10n 'Вставьте vless://, vmess://, trojan:// или ss:// ссылку' 'Paste a vless://, vmess://, trojan://, or ss:// URI')" 11 100)" || continue; output="$(import_profile "$uri" 2>&1)" || true; dialog --msgbox "$output" 12 80 ;;
+      5) subscription_tui ;;
+      6) output="$(status_cmd 2>&1)"; dialog --msgbox "$output" 20 92 ;;
+      7) output="$(probe_cmd 2>&1)" || true; dialog --msgbox "$output" 12 70 ;;
+      8)
         log_file="$(mktemp)"
         journalctl -u "$SERVICE" -n 200 --no-pager > "$log_file"
-        dialog --title "Журнал Xray" --textbox "$log_file" 28 100
+        dialog --title "$(l10n 'Журнал Xray' 'Xray journal')" --textbox "$log_file" 28 100
         rm -f -- "$log_file"
         ;;
-      8) name="$(choose_profile "Удаление")" || continue; if dialog --yesno "Удалить профиль '$name'?" 8 60; then output="$(delete_profile "$name" 2>&1)" || true; dialog --msgbox "$output" 9 70; fi ;;
-      9) output="$(autostart_cmd on 2>&1)" || true; dialog --msgbox "$output" 8 60 ;;
-      10) output="$(autostart_cmd off 2>&1)" || true; dialog --msgbox "$output" 8 60 ;;
+      9) name="$(choose_profile "$(l10n 'Удаление' 'Delete')")" || continue; if dialog --yesno "$(l10n "Удалить профиль '%s'?" "Delete profile '%s'?" "$name")" 8 60; then output="$(delete_profile "$name" 2>&1)" || true; dialog --msgbox "$output" 9 70; fi ;;
+      10) output="$(autostart_cmd on 2>&1)" || true; dialog --msgbox "$output" 8 60 ;;
+      11) output="$(autostart_cmd off 2>&1)" || true; dialog --msgbox "$output" 8 60 ;;
+      12) update_tui ;;
       0) break ;;
     esac
   done
@@ -651,6 +1083,7 @@ main() {
     install) install_app "$@" ;;
     tui) need_root "$cmd" "$@"; tui ;;
     import|add) need_root "$cmd" "$@"; import_profile "$@" ;;
+    subscription|sub) need_root "$cmd" "$@"; subscription_cmd "$@" ;;
     list) need_root "$cmd" "$@"; list_profiles ;;
     up|connect) need_root "$cmd" "$@"; up_profile "$@" ;;
     mode) need_root "$cmd" "$@"; set_mode "$@" ;;
@@ -661,6 +1094,7 @@ main() {
     show) need_root "$cmd" "$@"; show_profile "$@" ;;
     delete|rm) need_root "$cmd" "$@"; delete_profile "$@" ;;
     autostart) need_root "$cmd" "$@"; autostart_cmd "$@" ;;
+    update) need_root "$cmd" "$@"; update_cmd "$@" ;;
     tun-up) need_root "$cmd" "$@"; tun_up ;;
     tun-down) need_root "$cmd" "$@"; tun_down ;;
     *) usage >&2; exit 2 ;;
