@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="0.0.2"
+VERSION="0.0.3"
 APP="xray-tui"
 UPDATE_URL="${XRAY_TUI_UPDATE_URL:-https://raw.githubusercontent.com/RxtPR/xray-tui/main/xray-tui}"
 ETC_DIR="${XRAY_TUI_ETC:-/etc/xray-tui}"
@@ -14,6 +14,7 @@ SERVICE="xray-tui.service"
 TUN_NAME="xray0"
 TUN_TABLE="20220"
 TUN_STATE="/run/xray-tui/tun.state"
+TUN_DEVICE="${XRAY_TUI_TUN_DEVICE:-/dev/net/tun}"
 SOCKS_PORT="${XRAY_TUI_SOCKS_PORT:-10808}"
 HTTP_PORT="${XRAY_TUI_HTTP_PORT:-10809}"
 DEFAULT_MODE="${XRAY_TUI_DEFAULT_MODE:-tun}"
@@ -25,6 +26,75 @@ say() { printf '%s\n' "$*"; }
 err() { printf 'xray-tui: %s\n' "$*" >&2; }
 die() { err "$*"; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
+container_type() {
+  if [[ -n "${XRAY_TUI_CONTAINER+x}" ]]; then
+    printf '%s' "$XRAY_TUI_CONTAINER"
+  elif have systemd-detect-virt; then
+    systemd-detect-virt --container 2>/dev/null || true
+  elif tr '\0' '\n' < /proc/1/environ 2>/dev/null | grep -qx 'container=lxc'; then
+    printf 'lxc'
+  else
+    printf 'none'
+  fi
+}
+is_lxc() { [[ "$(container_type)" == "lxc" ]]; }
+
+tun_device_usable() {
+  [[ -c "$TUN_DEVICE" ]] || return 1
+  (exec {tun_fd}<>"$TUN_DEVICE" || exit 1; exec {tun_fd}>&-) 2>/dev/null
+}
+
+has_cap_net_admin() {
+  local effective
+  if [[ -n "${XRAY_TUI_CAP_NET_ADMIN:-}" ]]; then
+    [[ "$XRAY_TUI_CAP_NET_ADMIN" == "1" ]]
+    return
+  fi
+  effective="$(awk '/^CapEff:/ {print $2; exit}' /proc/self/status 2>/dev/null)"
+  [[ "$effective" =~ ^[[:xdigit:]]+$ ]] || return 1
+  (( (16#$effective & (1 << 12)) != 0 ))
+}
+
+lxc_tun_ready() { tun_device_usable && has_cap_net_admin; }
+
+lxc_tun_instructions() {
+  if [[ "$UI_LANG" == "ru" ]]; then
+    cat <<'EOF'
+Выполните на узле Proxmox (замените <CTID> на ID контейнера):
+  modprobe tun
+  pct stop <CTID>
+  pct set <CTID> --dev0 path=/dev/net/tun
+  pct start <CTID>
+
+Для старых версий Proxmox добавьте в /etc/pve/lxc/<CTID>.conf:
+  lxc.cgroup2.devices.allow: c 10:200 rwm
+  lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file
+Затем полностью остановите и снова запустите контейнер.
+EOF
+  else
+    cat <<'EOF'
+Run on the Proxmox host (replace <CTID> with the container ID):
+  modprobe tun
+  pct stop <CTID>
+  pct set <CTID> --dev0 path=/dev/net/tun
+  pct start <CTID>
+
+On older Proxmox versions, add to /etc/pve/lxc/<CTID>.conf:
+  lxc.cgroup2.devices.allow: c 10:200 rwm
+  lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file
+Then fully stop and start the container.
+EOF
+  fi
+}
+
+initial_install_mode() {
+  if [[ "$DEFAULT_MODE" == "tun" ]] && is_lxc && ! lxc_tun_ready; then
+    printf 'proxy'
+  else
+    printf '%s' "$DEFAULT_MODE"
+  fi
+}
+
 l10n() {
   local ru="$1" en="$2" format
   shift 2
@@ -54,6 +124,7 @@ Usage:
   sudo xray-tui delete NAME        delete a profile
   sudo xray-tui autostart on|off   control startup at boot
   sudo xray-tui update [--check]   check for and install updates
+  sudo xray-tui doctor             check system and LXC/TUN readiness
   sudo ./xray-tui install          install the application and systemd service
 
 Local proxies: SOCKS5 127.0.0.1:$SOCKS_PORT, HTTP 127.0.0.1:$HTTP_PORT
@@ -80,6 +151,7 @@ xray-tui $VERSION — менеджер подключений Xray для Debian
   sudo xray-tui delete NAME        удалить профиль
   sudo xray-tui autostart on|off   автозапуск активного профиля
   sudo xray-tui update [--check]   проверить и установить обновление
+  sudo xray-tui doctor             проверить систему и готовность LXC/TUN
   sudo ./xray-tui install          установить программу и systemd service
 
 Прокси после подключения: SOCKS5 127.0.0.1:$SOCKS_PORT, HTTP 127.0.0.1:$HTTP_PORT
@@ -157,7 +229,7 @@ install_xray_core() {
 
 install_app() {
   need_root install "$@"
-  local src xray_bin was_active=0
+  local src xray_bin install_mode was_active=0
   src="$(readlink -f "$0")"
   have apt-get || die "$(l10n 'установка поддерживается только на Debian/Ubuntu' 'installation is supported only on Debian/Ubuntu')"
   say "$(l10n 'Устанавливаю зависимости…' 'Installing dependencies…')"
@@ -168,7 +240,17 @@ install_app() {
   install_xray_core
   xray_bin="$(command -v xray)"
   install -d -m 0755 /usr/local/bin "$ETC_DIR" "$PROFILE_DIR" "$SUB_DIR"
-  [[ -f "$MODE_FILE" ]] || printf '%s\n' "$DEFAULT_MODE" > "$MODE_FILE"
+  if [[ ! -f "$MODE_FILE" ]]; then
+    install_mode="$(initial_install_mode)"
+    printf '%s\n' "$install_mode" > "$MODE_FILE"
+    if [[ "$install_mode" != "$DEFAULT_MODE" ]]; then
+      say "$(l10n 'Обнаружен LXC без доступного TUN: первая установка будет запущена в режиме Proxy.' 'Detected LXC without a usable TUN device: the initial mode is set to Proxy.')"
+      lxc_tun_instructions
+    fi
+  elif [[ "$(current_mode)" == "tun" ]] && is_lxc && ! lxc_tun_ready; then
+    say "$(l10n 'Внимание: сохранён режим TUN, но контейнер LXC ещё не имеет необходимых разрешений.' 'Warning: TUN mode is selected, but the LXC container does not have the required access yet.')"
+    lxc_tun_instructions
+  fi
   if [[ "$src" != "/usr/local/bin/xray-tui" ]]; then
     install -m 0755 "$src" /usr/local/bin/xray-tui
   fi
@@ -668,8 +750,62 @@ build_active_config() {
 }
 
 ensure_tun_available() {
-  [[ -c /dev/net/tun ]] || modprobe tun 2>/dev/null || true
-  [[ -c /dev/net/tun ]] || die "$(l10n 'устройство /dev/net/tun недоступно (проверьте поддержку TUN ядром или настройку VPS/контейнера)' '/dev/net/tun is unavailable (check kernel TUN support or VPS/container settings)')"
+  if [[ ! -c "$TUN_DEVICE" ]] && ! is_lxc; then
+    modprobe tun 2>/dev/null || true
+  fi
+  if ! tun_device_usable; then
+    if is_lxc; then
+      err "$(l10n 'устройство %s не передано в LXC или доступ к нему запрещён' '%s is not passed through to the LXC container or access is denied' "$TUN_DEVICE")"
+      lxc_tun_instructions >&2
+      return 1
+    fi
+    die "$(l10n 'устройство %s недоступно (проверьте поддержку TUN ядром)' '%s is unavailable (check kernel TUN support)' "$TUN_DEVICE")"
+  fi
+  if ! has_cap_net_admin; then
+    if is_lxc; then
+      err "$(l10n 'в LXC отсутствует capability CAP_NET_ADMIN, необходимая для TUN-маршрутизации' 'the LXC container lacks CAP_NET_ADMIN required for TUN routing')"
+      lxc_tun_instructions >&2
+      return 1
+    fi
+    die "$(l10n 'отсутствует capability CAP_NET_ADMIN' 'CAP_NET_ADMIN is unavailable')"
+  fi
+}
+
+doctor_cmd() {
+  local virt systemd_state
+  virt="$(container_type)"
+  [[ -n "$virt" ]] || virt="none"
+  if have systemctl; then
+    systemd_state="$(systemctl is-system-running 2>/dev/null || true)"
+    [[ -n "$systemd_state" ]] || systemd_state="unknown"
+  else
+    systemd_state="missing"
+  fi
+
+  say "$(l10n 'Среда: %s' 'Environment: %s' "$virt")"
+  say "$(l10n 'systemd: %s' 'systemd: %s' "$systemd_state")"
+  if [[ -c "$TUN_DEVICE" ]]; then
+    if tun_device_usable; then
+      say "$(l10n 'TUN-устройство: доступно (%s)' 'TUN device: accessible (%s)' "$TUN_DEVICE")"
+    else
+      say "$(l10n 'TUN-устройство: найдено, но доступ запрещён (%s)' 'TUN device: present but access is denied (%s)' "$TUN_DEVICE")"
+    fi
+  else
+    say "$(l10n 'TUN-устройство: отсутствует (%s)' 'TUN device: missing (%s)' "$TUN_DEVICE")"
+  fi
+  if has_cap_net_admin; then
+    say "$(l10n 'CAP_NET_ADMIN: доступна' 'CAP_NET_ADMIN: available')"
+  else
+    say "$(l10n 'CAP_NET_ADMIN: отсутствует' 'CAP_NET_ADMIN: unavailable')"
+  fi
+
+  if tun_device_usable && has_cap_net_admin; then
+    say "$(l10n 'Итог: режимы Proxy и TUN готовы к работе' 'Result: Proxy and TUN modes are ready')"
+    return 0
+  fi
+  say "$(l10n 'Итог: режим Proxy доступен, TUN требует настройки' 'Result: Proxy mode is available; TUN requires additional setup')"
+  is_lxc && lxc_tun_instructions
+  return 1
 }
 
 tun_down() {
@@ -1027,7 +1163,7 @@ tui() {
   local choice uri name output log_file mode
   while true; do
     mode="$(current_mode)"
-    choice="$(dialog --stdout --clear --title "$(l10n 'Xray TUI %s — режим: %s' 'Xray TUI %s — mode: %s' "$VERSION" "$mode")" --menu "$(l10n 'Управление подключением Xray' 'Xray connection management')" 24 82 13 \
+    choice="$(dialog --stdout --clear --title "$(l10n 'Xray TUI %s — режим: %s' 'Xray TUI %s — mode: %s' "$VERSION" "$mode")" --menu "$(l10n 'Управление подключением Xray' 'Xray connection management')" 25 88 14 \
       1 "$(l10n 'Подключить / переключить профиль' 'Connect / switch profile')" \
       2 "$(l10n 'Отключиться' 'Disconnect')" \
       3 "$(l10n 'Выбрать режим: Proxy или системный TUN' 'Select mode: Proxy or system-wide TUN')" \
@@ -1040,6 +1176,7 @@ tui() {
       10 "$(l10n 'Включить автозапуск' 'Enable autostart')" \
       11 "$(l10n 'Выключить автозапуск' 'Disable autostart')" \
       12 "$(l10n 'Проверить обновления' 'Check for updates')" \
+      13 "$(l10n 'Проверить систему и TUN/LXC' 'Check system and TUN/LXC')" \
       0 "$(l10n 'Выход' 'Exit')")" || break
     case "$choice" in
       1)
@@ -1069,6 +1206,7 @@ tui() {
       10) output="$(autostart_cmd on 2>&1)" || true; dialog --msgbox "$output" 8 60 ;;
       11) output="$(autostart_cmd off 2>&1)" || true; dialog --msgbox "$output" 8 60 ;;
       12) update_tui ;;
+      13) output="$(doctor_cmd 2>&1)" || true; dialog --msgbox "$output" 22 96 ;;
       0) break ;;
     esac
   done
@@ -1095,6 +1233,7 @@ main() {
     delete|rm) need_root "$cmd" "$@"; delete_profile "$@" ;;
     autostart) need_root "$cmd" "$@"; autostart_cmd "$@" ;;
     update) need_root "$cmd" "$@"; update_cmd "$@" ;;
+    doctor) need_root "$cmd" "$@"; doctor_cmd ;;
     tun-up) need_root "$cmd" "$@"; tun_up ;;
     tun-down) need_root "$cmd" "$@"; tun_down ;;
     *) usage >&2; exit 2 ;;

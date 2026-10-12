@@ -5,7 +5,8 @@
 переключает профили через systemd и показывает состояние и журнал. Поддерживает
 локальный Proxy, полноценный системный TUN и подписки на списки серверов.
 Интерфейс автоматически переключается между русским и английским по языку
-системы. Для новых установок режим TUN выбран по умолчанию.
+системы. Для новых установок режим TUN выбран по умолчанию; в LXC без
+проброшенного `/dev/net/tun` установщик безопасно выбирает Proxy.
 
 ## Установка
 
@@ -36,6 +37,7 @@ sudo xray-tui list
 sudo xray-tui up имя-профиля
 sudo xray-tui mode tun
 sudo xray-tui status
+sudo xray-tui doctor
 sudo xray-tui probe
 sudo xray-tui logs 200
 sudo xray-tui down
@@ -105,9 +107,11 @@ sudo xray-tui mode proxy
 sudo xray-tui mode tun
 ```
 
-На новой установке по умолчанию используется `tun`. Выбранный режим сохраняется
-между запусками. Чтобы изменить начальное значение при автоматической установке,
-задайте `XRAY_TUI_DEFAULT_MODE=proxy`.
+На новой установке по умолчанию используется `tun`. Исключение — LXC без
+доступного TUN-устройства: там установщик выбирает `proxy` и показывает команды
+настройки Proxmox. Выбранный режим сохраняется между запусками. Чтобы изменить
+начальное значение при автоматической установке, задайте
+`XRAY_TUI_DEFAULT_MODE=proxy`.
 
 В режиме `proxy` Xray слушает только localhost:
 
@@ -130,6 +134,38 @@ sudo xray-tui mode tun
 Поддерживаются наиболее распространённые транспорты Xray: TCP, WebSocket,
 gRPC, HTTPUpgrade, XHTTP/SplitHTTP, HTTP/2 и mKCP, а также TLS и REALITY.
 
+## Proxmox LXC
+
+Proxy-режим работает в LXC без специальной настройки. Для системного TUN
+контейнеру требуются `/dev/net/tun` и `CAP_NET_ADMIN`. Проверить готовность:
+
+```bash
+sudo xray-tui doctor
+```
+
+Если TUN не передан, выполните на узле Proxmox, заменив `<CTID>` на ID
+контейнера:
+
+```bash
+modprobe tun
+pct stop <CTID>
+pct set <CTID> --dev0 path=/dev/net/tun
+pct start <CTID>
+```
+
+На старых версиях Proxmox, где параметр `dev0` недоступен, добавьте в
+`/etc/pve/lxc/<CTID>.conf`:
+
+```text
+lxc.cgroup2.devices.allow: c 10:200 rwm
+lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file
+```
+
+После изменения полностью остановите и снова запустите контейнер. Установщик
+не пытается ослаблять изоляцию LXC изнутри: если TUN недоступен при первой
+установке, выбирается Proxy, а после настройки можно выполнить
+`sudo xray-tui mode tun`.
+
 ## Удаление
 
 ```bash
@@ -150,7 +186,8 @@ generated configurations with Xray Core, switches profiles through systemd,
 and provides status and journal views. Both local proxy and system-wide TUN
 modes are supported.
 The interface automatically selects Russian or English based on the system
-locale. New installations use TUN mode by default.
+locale. New installations use TUN mode by default; an LXC container without a
+passed-through `/dev/net/tun` safely falls back to Proxy mode.
 
 ## Features
 
@@ -195,6 +232,7 @@ sudo xray-tui list
 sudo xray-tui up profile-name
 sudo xray-tui mode tun
 sudo xray-tui status
+sudo xray-tui doctor
 sudo xray-tui probe
 sudo xray-tui logs 200
 sudo xray-tui down
@@ -272,9 +310,11 @@ sudo xray-tui mode proxy
 sudo xray-tui mode tun
 ```
 
-New installations default to `tun`, and the selected mode persists across
-restarts. Set `XRAY_TUI_DEFAULT_MODE=proxy` to change the initial value during
-automated installation.
+New installations default to `tun`. The exception is an LXC container without
+a usable TUN device: the installer selects `proxy` and prints the required
+Proxmox host commands. The selected mode persists across restarts. Set
+`XRAY_TUI_DEFAULT_MODE=proxy` to change the initial value during automated
+installation.
 
 ### Proxy mode
 
@@ -301,6 +341,39 @@ Enabling a full tunnel over a remote SSH session may change that session's
 route, so make sure you have backup console access.
 
 The local SOCKS5 and HTTP listeners remain available in TUN mode.
+
+## Proxmox LXC
+
+Proxy mode works in LXC without special host configuration. System-wide TUN
+requires both `/dev/net/tun` and `CAP_NET_ADMIN` inside the container. Check the
+environment with:
+
+```bash
+sudo xray-tui doctor
+```
+
+If the TUN device is missing, run the following on the Proxmox host, replacing
+`<CTID>` with the container ID:
+
+```bash
+modprobe tun
+pct stop <CTID>
+pct set <CTID> --dev0 path=/dev/net/tun
+pct start <CTID>
+```
+
+On older Proxmox versions without the `dev0` option, add these lines to
+`/etc/pve/lxc/<CTID>.conf`:
+
+```text
+lxc.cgroup2.devices.allow: c 10:200 rwm
+lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file
+```
+
+Fully stop and start the container after changing its configuration. The
+installer does not weaken LXC isolation from inside the guest: when TUN is not
+available during the first installation, it selects Proxy mode. After passing
+the device through, enable TUN with `sudo xray-tui mode tun`.
 
 ## Verifying TUN mode
 
